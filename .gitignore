@@ -10,3 +10,9 @@ __pycache__/
 
 # pip
 *.egg-info/
+
+# Bundled runtime DLL (build artifact, not source)
+vcruntime140.dll
+
+# Built installers - published as GitHub release assets, not committed
+releases/

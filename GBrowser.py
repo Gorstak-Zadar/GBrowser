@@ -1,4 +1,4 @@
-# GBROWSER 2025 — Full-featured Python browser (ported from Ceprkac C#)
+# GBROWSER 2025 - Full-featured Python browser (ported from Ceprkac C#)
 # Python 3.13 + PyQt6 + PyQt6-WebEngine
 # Logic-matched to Ceprkac: OAuth popups, downloads, custom tab strip, auth callbacks
 import sys
@@ -30,9 +30,12 @@ from urllib.parse import urlparse, quote_plus
 from PyQt6.QtWidgets import *
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import *
-from PyQt6.QtCore import Qt, QUrl, QTimer, QPoint, QRect, QSize, pyqtSignal
+from PyQt6.QtWebChannel import QWebChannel
+from PyQt6.QtCore import (Qt, QUrl, QTimer, QPoint, QRect, QSize, pyqtSignal,
+                          pyqtSlot, QObject)
 from PyQt6.QtGui import (QIcon, QPainter, QPixmap, QColor, QFont, QPen, QBrush,
-                          QKeySequence, QShortcut, QPainterPath, QAction, QFontMetrics)
+                          QKeySequence, QShortcut, QPainterPath, QAction, QFontMetrics,
+                          QCursor)
 
 # === Fernet fallback for non-Windows password encryption ===
 try:
@@ -54,6 +57,8 @@ PASSWORDS_FILE = os.path.join(CONFIG_DIR, "passwords.dat")
 SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.txt")
 MEDIA_PERM_FILE = os.path.join(CONFIG_DIR, "media_permissions.json")
 DOWNLOADS_FILE = os.path.join(CONFIG_DIR, "downloads.json")
+CARDS_FILE = os.path.join(CONFIG_DIR, "cards.dat")
+ADDRESSES_FILE = os.path.join(CONFIG_DIR, "addresses.dat")
 
 # === COLOUR PALETTE (Chrome-dark inspired, matching Ceprkac) ===
 class Theme:
@@ -216,7 +221,7 @@ AD_BLOCK_WHITELIST: set[str] = {
     "discord.com","discordapp.com","discord.gg","discord.media",
     "apple.com","icloud.com","ebay.com","paypal.com","mediafire.com",
     # Auth/OAuth providers
-    # Do NOT whitelist google.com itself — that also allows ads.google.com /
+    # Do NOT whitelist google.com itself - that also allows ads.google.com /
     # adservice.google.com (parent-domain walk) and lets GPT ads through on
     # news sites. First-party requests on google.com are already allowed.
     "accounts.google.com","accounts.youtube.com","myaccount.google.com",
@@ -580,10 +585,23 @@ class PasswordManager:
             pass
 
     def get_matches(self, domain: str) -> list[SavedCredential]:
+        """Match on exact host OR registrable-domain suffix (Ceprkac 0.8.0), so
+        accounts.google.com credentials fill on the google.com password step and
+        vice versa."""
         matches = []
+        domain = (domain or "").lower()
         for p in self.passwords:
             try:
-                if urlparse(p.url).hostname and urlparse(p.url).hostname.lower() == domain:
+                saved = (urlparse(p.url).hostname or "").lower()
+                if not saved:
+                    continue
+                # Exact host, or a suffix relationship that still shares the same
+                # registrable domain (so accounts.google.com <-> google.com matches
+                # but a broad saved host cannot leak onto an unrelated site).
+                if saved == domain:
+                    matches.append(p)
+                elif ((domain.endswith("." + saved) or saved.endswith("." + domain))
+                      and _same_site(saved, domain)):
                     matches.append(p)
             except Exception:
                 pass
@@ -620,6 +638,205 @@ class PasswordManager:
     def clear(self):
         self.passwords.clear()
         self.save()
+
+    def find_exact(self, host: str, username: str):
+        """Return the saved credential for host+username, or None."""
+        host = (host or "").lower()
+        for c in self.passwords:
+            try:
+                if ((urlparse(c.url).hostname or "").lower() == host
+                        and c.username == (username or "")):
+                    return c
+            except Exception:
+                pass
+        return None
+
+    def add_or_update(self, url: str, username: str, password: str):
+        try:
+            host = (urlparse(url).hostname or "").lower()
+        except Exception:
+            host = ""
+        existing = self.find_exact(host, username) if host else None
+        if existing is not None:
+            existing.password = password
+            if url:
+                existing.url = url
+        else:
+            self.passwords.append(SavedCredential(url, username or "", password))
+        self.save()
+
+
+# === DPAPI / Fernet blob helpers (shared by cards & addresses) ===
+def _encrypt_blob(raw: bytes) -> bytes:
+    if DPAPI:
+        import win32crypt
+        return win32crypt.CryptProtectData(raw, None, None, None, None, 0)
+    if _HAS_FERNET:
+        return _Fernet(_get_fernet_key()).encrypt(raw)
+    return raw
+
+
+def _decrypt_blob(data: bytes) -> bytes:
+    if DPAPI:
+        import win32crypt
+        return win32crypt.CryptUnprotectData(data, None, None, None, 0)[1]
+    if _HAS_FERNET:
+        return _Fernet(_get_fernet_key()).decrypt(data)
+    return data
+
+
+# === PAYMENT METHODS (cards) - DPAPI at rest, same scheme as passwords ===
+class SavedCard:
+    def __init__(self, label="", name="", number="", exp_month="", exp_year="", cvc=""):
+        self.label = label
+        self.name = name
+        self.number = number
+        self.exp_month = exp_month
+        self.exp_year = exp_year
+        self.cvc = cvc
+
+    @property
+    def last4(self) -> str:
+        digits = re.sub(r"\D", "", self.number or "")
+        return digits[-4:] if len(digits) >= 4 else digits
+
+    @property
+    def display(self) -> str:
+        base = self.label or self.name or "Card"
+        return f"{base}  ---- {self.last4}" if self.last4 else base
+
+
+class CardManager:
+    def __init__(self):
+        self.cards: list[SavedCard] = []
+        self.load()
+
+    def load(self):
+        if not os.path.exists(CARDS_FILE):
+            return
+        try:
+            data = json.loads(_decrypt_blob(open(CARDS_FILE, "rb").read()).decode("utf-8"))
+            self.cards = [SavedCard(d.get("label", ""), d.get("name", ""), d.get("num", ""),
+                                    d.get("em", ""), d.get("ey", ""), d.get("cvc", ""))
+                          for d in data if d.get("num")]
+        except Exception:
+            pass
+
+    def save(self):
+        try:
+            data = [{"label": c.label, "name": c.name, "num": c.number,
+                     "em": c.exp_month, "ey": c.exp_year, "cvc": c.cvc} for c in self.cards]
+            raw = json.dumps(data).encode("utf-8")
+            with open(CARDS_FILE, "wb") as f:
+                f.write(_encrypt_blob(raw))
+        except Exception:
+            pass
+
+
+# === ADDRESSES / contact profiles - DPAPI at rest ===
+class SavedAddress:
+    def __init__(self, label="", full_name="", email="", phone="", line1="", line2="",
+                 city="", state="", postal_code="", country=""):
+        self.label = label
+        self.full_name = full_name
+        self.email = email
+        self.phone = phone
+        self.line1 = line1
+        self.line2 = line2
+        self.city = city
+        self.state = state
+        self.postal_code = postal_code
+        self.country = country
+
+    @property
+    def display(self) -> str:
+        base = self.label or self.full_name or self.email or "Address"
+        loc = ", ".join(x for x in (self.city, self.country) if x)
+        return f"{base}  ({loc})" if loc else base
+
+
+class AddressManager:
+    def __init__(self):
+        self.addresses: list[SavedAddress] = []
+        self.load()
+
+    def load(self):
+        if not os.path.exists(ADDRESSES_FILE):
+            return
+        try:
+            data = json.loads(_decrypt_blob(open(ADDRESSES_FILE, "rb").read()).decode("utf-8"))
+            for d in data:
+                a = SavedAddress(d.get("label", ""), d.get("name", ""), d.get("email", ""),
+                                 d.get("phone", ""), d.get("l1", ""), d.get("l2", ""),
+                                 d.get("city", ""), d.get("state", ""), d.get("zip", ""),
+                                 d.get("country", ""))
+                if a.full_name or a.line1:
+                    self.addresses.append(a)
+        except Exception:
+            pass
+
+    def save(self):
+        try:
+            data = [{"label": a.label, "name": a.full_name, "email": a.email, "phone": a.phone,
+                     "l1": a.line1, "l2": a.line2, "city": a.city, "state": a.state,
+                     "zip": a.postal_code, "country": a.country} for a in self.addresses]
+            raw = json.dumps(data).encode("utf-8")
+            with open(ADDRESSES_FILE, "wb") as f:
+                f.write(_encrypt_blob(raw))
+        except Exception:
+            pass
+
+
+# Detect card / address fields on the current page (Ceprkac detectJs).
+CHECKOUT_DETECT_JS = r"""(function(){
+    function has(sel){ try { return !!document.querySelector(sel); } catch(e){ return false; } }
+    var card = has('input[autocomplete="cc-number"]') || has('input[name*="cardnumber" i]') ||
+               has('input[autocomplete="cc-csc"]') || has('input[name*="card" i][name*="num" i]');
+    var addr = has('input[autocomplete="address-line1"]') || has('input[autocomplete="street-address"]') ||
+               has('input[autocomplete="postal-code"]') || has('input[name*="address1" i]') ||
+               has('input[name*="street" i]');
+    return (card ? 'card' : '') + (addr ? 'addr' : '');
+})()"""
+
+
+def _make_fill_card_js(card: "SavedCard") -> str:
+    def j(s): return json.dumps(s or "")
+    exp2 = card.exp_year[-2:] if len(card.exp_year) >= 2 else card.exp_year
+    return f"""(function(){{
+    function setVal(el,val){{ if(!el||!val)return;
+        var s=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;
+        s.call(el,val); el.dispatchEvent(new Event('input',{{bubbles:true}}));
+        el.dispatchEvent(new Event('change',{{bubbles:true}})); }}
+    function pick(){{ for(var i=0;i<arguments.length;i++){{ try{{var e=document.querySelector(arguments[i]); if(e)return e;}}catch(x){{}} }} return null; }}
+    setVal(pick('input[autocomplete="cc-number"]','input[name*="cardnumber" i]','input[name*="card" i][name*="num" i]','input[id*="card" i][id*="num" i]'), {j(card.number)});
+    setVal(pick('input[autocomplete="cc-name"]','input[name*="cardholder" i]','input[name*="ccname" i]','input[id*="cardname" i]'), {j(card.name)});
+    setVal(pick('input[autocomplete="cc-csc"]','input[name*="cvc" i]','input[name*="cvv" i]','input[id*="cvc" i]','input[id*="cvv" i]'), {j(card.cvc)});
+    var exp=pick('input[autocomplete="cc-exp"]','input[name*="exp" i]','input[id*="exp" i]');
+    if(exp) setVal(exp, {j(card.exp_month + "/" + exp2)});
+    setVal(pick('input[autocomplete="cc-exp-month"]','select[autocomplete="cc-exp-month"]','input[name*="expmonth" i]','[id*="expmonth" i]'), {j(card.exp_month)});
+    setVal(pick('input[autocomplete="cc-exp-year"]','select[autocomplete="cc-exp-year"]','input[name*="expyear" i]','[id*="expyear" i]'), {j(card.exp_year)});
+}})()"""
+
+
+def _make_fill_address_js(a: "SavedAddress") -> str:
+    def j(s): return json.dumps(s or "")
+    return f"""(function(){{
+    function setVal(el,val){{ if(!el||!val)return;
+        var s=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set
+            ||Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype,'value').set;
+        s.call(el,val); el.dispatchEvent(new Event('input',{{bubbles:true}}));
+        el.dispatchEvent(new Event('change',{{bubbles:true}})); }}
+    function pick(){{ for(var i=0;i<arguments.length;i++){{ try{{var e=document.querySelector(arguments[i]); if(e)return e;}}catch(x){{}} }} return null; }}
+    setVal(pick('input[autocomplete="name"]','input[name*="fullname" i]','input[name="name"]','input[id*="fullname" i]'), {j(a.full_name)});
+    setVal(pick('input[autocomplete="email"]','input[type="email"]','input[name*="email" i]'), {j(a.email)});
+    setVal(pick('input[autocomplete="tel"]','input[type="tel"]','input[name*="phone" i]'), {j(a.phone)});
+    setVal(pick('input[autocomplete="address-line1"]','input[autocomplete="street-address"]','input[name*="address1" i]','input[name*="street" i]','input[id*="address1" i]'), {j(a.line1)});
+    setVal(pick('input[autocomplete="address-line2"]','input[name*="address2" i]','input[id*="address2" i]'), {j(a.line2)});
+    setVal(pick('input[autocomplete="address-level2"]','input[name*="city" i]','input[id*="city" i]'), {j(a.city)});
+    setVal(pick('input[autocomplete="address-level1"]','input[name*="state" i]','input[name*="region" i]','input[id*="state" i]'), {j(a.state)});
+    setVal(pick('input[autocomplete="postal-code"]','input[name*="zip" i]','input[name*="postal" i]','input[id*="zip" i]','input[id*="postal" i]'), {j(a.postal_code)});
+    setVal(pick('input[autocomplete="country"]','input[name*="country" i]','select[name*="country" i]','[id*="country" i]'), {j(a.country)});
+}})()"""
 
 
 # === BOOKMARK DATA MODEL (Same as Ceprkac) ===
@@ -898,6 +1115,15 @@ class ChromeTab:
         self.zoom_factor: float = 1.0
         self.is_popup: bool = False
         self.focus_omnibox: bool = False
+        # Per-URL monotonic autofill keying (Ceprkac parity): a genuinely new page
+        # always re-attempts; a stale retry loop self-cancels when the URL moves on.
+        self.autofill_token: int = 0
+        self.last_autofill_url: str = ""
+        self.autofill_in_progress: bool = False
+        self.last_checkout_attempt: float = 0
+        self.last_checkout_url: str = ""
+        self.checkout_token: int = 0
+        self.checkout_in_progress: bool = False
 
 
 class ChromeTabStrip(QWidget):
@@ -1142,7 +1368,7 @@ class AdBlockInterceptor(QWebEngineUrlRequestInterceptor):
             # Determine if this is a same-site (first-party) request
             is_first_party = first_party_host and _same_site(host, first_party_host)
 
-            # Same-site requests are NEVER blocked — sites need their own
+            # Same-site requests are NEVER blocked - sites need their own
             # subdomains for auth, APIs, telemetry, content delivery, etc.
             if is_first_party:
                 return
@@ -1153,7 +1379,7 @@ class AdBlockInterceptor(QWebEngineUrlRequestInterceptor):
                 self.blocked_count += 1
                 return
 
-            # GSecurity path rules (/pagead.js, adsbygoogle.js, …) — third-party only
+            # GSecurity path rules (/pagead.js, adsbygoogle.js, ...) - third-party only
             if AD_PATH_FILTERS:
                 full = info.requestUrl().toString().lower()
                 for snippet in AD_PATH_FILTERS:
@@ -1358,13 +1584,13 @@ class BrowserPage(QWebEnginePage):
         url_str = url.toString()
         url_lower = url_str.lower()
 
-        # Never block main-frame navigations — the user or the page itself is navigating.
+        # Never block main-frame navigations - the user or the page itself is navigating.
         # Only block ad URLs in sub-frames (iframes loading ad content).
         if is_main_frame:
             self._last_url = url_str
             return True
 
-        # Reject ad iframes only. Do NOT goBack() — a news site like index.hr
+        # Reject ad iframes only. Do NOT goBack() - a news site like index.hr
         # loads many ad frames, and going back would bounce to the previous
         # page (usually the Google homepage).
         if _is_ad_url(url_lower):
@@ -1376,7 +1602,7 @@ class BrowserPage(QWebEnginePage):
     def createWindow(self, window_type):
         """Load window.open() into a real tab so window.opener stays intact.
 
-        Do not use a separate QDialog WebEngine view — that renders black
+        Do not use a separate QDialog WebEngine view - that renders black
         and breaks Google/Reddit OAuth.
         """
         if not self.browser_window:
@@ -1386,6 +1612,33 @@ class BrowserPage(QWebEnginePage):
             return None
         tab.is_popup = True
         return tab.web_view.page()
+
+
+# === WEB VIEW WITH CEPRKAC-STYLE CONTEXT MENU ===
+class BrowserWebView(QWebEngineView):
+    """QWebEngineView that adds Google Lens / reverse-image / media search entries
+    to the right-click menu, using the JS-captured target (Ceprkac ContextCaptureJs)."""
+
+    def __init__(self, browser_window=None, parent=None):
+        super().__init__(parent)
+        self._browser_window = browser_window
+
+    def contextMenuEvent(self, event):
+        bw = self._browser_window
+        page = self.page()
+        if not bw or not page:
+            super().contextMenuEvent(event)
+            return
+        # Read the JS-captured target; native contextMenuData is often empty on
+        # Discord/CDN images. runJavaScript is async, so build the menu in the callback.
+        # Capture the view (self) so _build_context_menu can verify it is still live
+        # before touching its page - the tab may be closed during the async gap.
+        view = self
+        page.runJavaScript(
+            "window.__gbrowserLastCtx ? JSON.stringify(window.__gbrowserLastCtx) : 'null'",
+            0,
+            lambda raw: bw._build_context_menu(view, raw),
+        )
 
 
 # === AD ELEMENT HIDER JS (Same as Ceprkac) ===
@@ -1453,7 +1706,7 @@ AD_ELEMENT_HIDER_JS = r"""(function() {
         '[data-test-selector="ad-banner-default-id"]','.stream-display-ad',
         /* TikTok ads */
         '[class*="DivAdBanner"]','[data-e2e="ad"]',
-        /* Croatian news portals (24sata, index.hr, …) */
+        /* Croatian news portals (24sata, index.hr, ...) */
         'div[id^="div-gpt-ad"]','div[id^="google_ads_"]','div[id*="gpt-ad"]',
         '.dfp-ad','.dfp_ad','.gpt-ad','.adSlot','.ad-slot','.AdSlot',
         '.reklama','.oglas','[class*="Reklama"]','[id*="reklama"]',
@@ -1541,7 +1794,7 @@ AD_ELEMENT_HIDER_JS = r"""(function() {
         try {
             document.querySelectorAll('article, [data-testid="placementTracking"]').forEach(function(el) {
                 var text = (el.textContent || '').toLowerCase();
-                if (/\bpromoted\b/.test(text) || /\bad\s*·/.test(text) || el.matches('[data-testid="placementTracking"]')) {
+                if (/\bpromoted\b/.test(text) || /\bad\s*-/.test(text) || el.matches('[data-testid="placementTracking"]')) {
                     el.style.display = 'none';
                 }
             });
@@ -1569,13 +1822,13 @@ YOUTUBE_AD_BLOCKER_JS = r"""(function() {
     ['ytInitialPlayerResponse','ytInitialData','ytcfg'].forEach(function(p){var v=window[p];try{Object.defineProperty(window,p,{configurable:true,get:function(){return v;},set:function(n){if(n&&typeof n==='object')stripAds(n,0);v=n;}});if(v)window[p]=v;}catch(e){}});
     var adS=['.video-ads','.ytp-ad-module','.ytp-ad-overlay-container','.ytp-ad-player-overlay','.ytp-ad-action-interstitial','.ytp-ad-image-overlay','.ytp-ad-text-overlay','#player-ads','#masthead-ad','ytd-display-ad-renderer','ytd-ad-slot-renderer','ytd-promoted-video-renderer','ytd-promoted-sparkles-web-renderer','ytd-banner-promo-renderer','ytd-in-feed-ad-layout-renderer','ytd-mealbar-promo-renderer','ytd-enforcement-message-view-model','ytd-search-pyv-renderer','ytd-movie-offer-module-renderer','ytd-compact-promoted-video-renderer','ytd-action-companion-ad-renderer','ytd-primetime-promo-renderer','ytd-masthead-ad-renderer'];
     var skS=['.ytp-ad-skip-button','.ytp-skip-ad-button','.ytp-ad-skip-button-modern','.ytp-skip-ad-button__text','button[class*="skip"]','.ytp-ad-overlay-close-button','.ytp-ad-skip-button-slot'];
-    var sponsorWords=['sponsored','sponzorirano','gesponsert','sponsorisé','patrocinado','sponsorizzato','gesponsord','\u0441\u043f\u043e\u043d\u0441\u0438\u0440\u0443\u0435\u043c\u0430\u044f','\u30b9\u30dd\u30f3\u30b5\u30fc','\u8d5e\u52a9','\uad11\uace0','reklam','promowane','sponzorované','szponzorált','annonce','reklama','hirdetés','\u0440\u0435\u043a\u043b\u0430\u043c\u0430','commandité','gesponsord','publicidad','pubblicità','anúncio','reklame','sponzorováno','sponzorirane','\u0441\u043f\u043e\u043d\u0437\u043e\u0440\u0438\u0440\u0430\u043d\u043e'];
+    var sponsorWords=['sponsored','sponzorirano','gesponsert','sponsoris','patrocinado','sponsorizzato','gesponsord','\u0441\u043f\u043e\u043d\u0441\u0438\u0440\u0443\u0435\u043c\u0430\u044f','\u30b9\u30dd\u30f3\u30b5\u30fc','\u8d5e\u52a9','\uad11\uace0','reklam','promowane','sponzorovan','szponzorlt','annonce','reklama','hirdets','\u0440\u0435\u043a\u043b\u0430\u043c\u0430','commandit','gesponsord','publicidad','pubblicit','anncio','reklame','sponzorovno','sponzorirane','\u0441\u043f\u043e\u043d\u0437\u043e\u0440\u0438\u0440\u0430\u043d\u043e'];
     function isSponsoredText(t){t=t.trim().toLowerCase();for(var i=0;i<sponsorWords.length;i++){if(t===sponsorWords[i])return true;}return false;}
     function scrub(){for(var i=0;i<adS.length;i++)document.querySelectorAll(adS[i]).forEach(function(e){var p=e.closest('ytd-rich-item-renderer,ytd-rich-section-renderer,ytd-reel-shelf-renderer');if(p)p.remove();else e.remove();});for(var j=0;j<skS.length;j++)document.querySelectorAll(skS[j]).forEach(function(b){if(b.click)b.click();});try{document.querySelectorAll('ytd-rich-item-renderer,ytd-rich-section-renderer').forEach(function(item){if(item.querySelector('ytd-ad-slot-renderer,ytd-display-ad-renderer,ytd-promoted-video-renderer,ytd-promoted-sparkles-web-renderer,ytd-in-feed-ad-layout-renderer')){item.remove();return;}var badges=item.querySelectorAll('span.ytd-badge-supported-renderer,ytd-badge-supported-renderer span,div.ytd-badge-supported-renderer,ytd-badge-supported-renderer,[class*="badge"],.badge,.badge-style-type-ad,span[aria-label]');for(var k=0;k<badges.length;k++){if(isSponsoredText(badges[k].textContent||'')){item.remove();return;}}var metas=item.querySelectorAll('#metadata-line span,#byline-container span,yt-formatted-string.ytd-channel-name');for(var m=0;m<metas.length;m++){if(isSponsoredText(metas[m].textContent||'')){item.remove();return;}}});}catch(e){}try{document.querySelectorAll('ytd-video-renderer,ytd-compact-video-renderer').forEach(function(item){var badges=item.querySelectorAll('span.ytd-badge-supported-renderer,ytd-badge-supported-renderer span,[class*="badge"]');for(var k=0;k<badges.length;k++){if(isSponsoredText(badges[k].textContent||'')){item.remove();return;}}});}catch(e){}var p=document.querySelector('.html5-video-player'),v=document.querySelector('video');if(p&&v&&(p.classList.contains('ad-showing')||p.classList.contains('ad-interrupting'))){if(Number.isFinite(v.duration)&&v.duration>0){v.currentTime=Math.max(0,v.duration-0.1);}v.muted=true;v.playbackRate=16;try{v.play();}catch(e){}p.classList.remove('ad-showing');p.classList.remove('ad-interrupting');p.classList.remove('ad-created');document.querySelectorAll('.ytp-ad-skip-button,.ytp-skip-ad-button,.ytp-ad-skip-button-modern').forEach(function(b){b.click();});setTimeout(function(){v.muted=false;v.playbackRate=1;},500);}document.querySelectorAll('ytd-rich-item-renderer').forEach(function(el){var hasAd=!!el.querySelector('ytd-ad-slot-renderer,ytd-display-ad-renderer,ytd-promoted-video-renderer,ytd-promoted-sparkles-web-renderer');if(hasAd){el.remove();return;}});document.querySelectorAll('tp-yt-paper-dialog').forEach(function(d){var t=(d.textContent||'').toLowerCase();if(t.includes('ad blocker')||t.includes('allow ads')){var b=d.querySelector('#dismiss-button,.dismiss-button,button');if(b&&b.click)b.click();d.remove();}});}
     scrub();setInterval(scrub,200);new MutationObserver(scrub).observe(document.documentElement,{childList:true,subtree:true});
 })()"""
 
-# YouTube main-world ad blocker — injected via <script> tag to run in main world
+# YouTube main-world ad blocker - injected via <script> tag to run in main world
 # before any page scripts. Intercepts JSON.parse, ytInitialData, fetch responses.
 # Ported from Ceprkac's BuildYouTubeMainWorldCode().
 YOUTUBE_MAIN_WORLD_JS = (
@@ -1704,6 +1957,28 @@ def _make_fill_js(username: str, password: str) -> str:
     nativeSet2.call(pw, p);
     pw.dispatchEvent(new Event('input', {{bubbles:true}}));
     pw.dispatchEvent(new Event('change', {{bubbles:true}}));
+}})()"""
+
+
+def _make_fill_password_js(password: str) -> str:
+    """Fill ONLY the visible password field (Ceprkac FillPasswordOnly). Password-only
+    steps (Google's /signin/.../pwd, re-auth prompts) carry a hidden username input the
+    site populates itself; writing to it can break the flow."""
+    esc_p = json.dumps(password)
+    return f"""(function(){{
+    var p={esc_p};
+    var pws = document.querySelectorAll('input[type="password"]');
+    var pw = null;
+    for (var i = 0; i < pws.length; i++) {{
+        if (pws[i].offsetParent !== null && pws[i].offsetWidth > 0) {{ pw = pws[i]; break; }}
+    }}
+    if (!pw && pws.length) pw = pws[0];
+    if (!pw) return;
+    var nativeSet = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+    nativeSet.call(pw, p);
+    pw.dispatchEvent(new Event('input', {{bubbles:true}}));
+    pw.dispatchEvent(new Event('change', {{bubbles:true}}));
+    pw.dispatchEvent(new Event('blur', {{bubbles:true}}));
 }})()"""
 
 
@@ -1872,9 +2147,9 @@ class DownloadManagerDialog(QDialog):
         for dl in reversed(downloads):
             if dl.total > 0:
                 pct = int(dl.received * 100 / dl.total)
-                text = f"{dl.filename}  —  {pct}%  ({dl.status})"
+                text = f"{dl.filename}  -  {pct}%  ({dl.status})"
             else:
-                text = f"{dl.filename}  —  {dl.received} bytes  ({dl.status})"
+                text = f"{dl.filename}  -  {dl.received} bytes  ({dl.status})"
             self._list.addItem(text)
         layout.addWidget(self._list, 1)
 
@@ -1884,6 +2159,345 @@ class DownloadManagerDialog(QDialog):
             f"color: black; border: none; border-radius: 4px; padding: 6px 16px; }}")
         close_btn.clicked.connect(self.reject)
         layout.addWidget(close_btn, alignment=Qt.AlignmentFlag.AlignRight)
+
+
+class CredentialEditDialog(QDialog):
+    """Add / edit a single saved credential (URL, username, password)."""
+
+    def __init__(self, cred: SavedCredential | None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit Password" if cred else "Add Password")
+        self.setMinimumWidth(380)
+        self.setStyleSheet(
+            f"QDialog {{ background: rgb({Theme.ActiveTab.red()},{Theme.ActiveTab.green()},{Theme.ActiveTab.blue()}); color: white; }}"
+            f"QLabel {{ color: white; }}"
+            f"QLineEdit {{ background: rgb({Theme.AddressBox.red()},{Theme.AddressBox.green()},{Theme.AddressBox.blue()});"
+            f" color: white; border: 1px solid rgb({Theme.Border.red()},{Theme.Border.green()},{Theme.Border.blue()});"
+            f" border-radius: 4px; padding: 4px 8px; }}")
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Site URL"))
+        self._url = QLineEdit(cred.url if cred else "")
+        layout.addWidget(self._url)
+        layout.addWidget(QLabel("Username / Email"))
+        self._user = QLineEdit(cred.username if cred else "")
+        layout.addWidget(self._user)
+        layout.addWidget(QLabel("Password"))
+        self._pwd = QLineEdit(cred.password if cred else "")
+        self._pwd.setEchoMode(QLineEdit.EchoMode.Password)
+        layout.addWidget(self._pwd)
+        show = QCheckBox("Show password")
+        show.setStyleSheet("color: white;")
+        show.toggled.connect(lambda on: self._pwd.setEchoMode(
+            QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password))
+        layout.addWidget(show)
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        ok = QPushButton("Save")
+        ok.setStyleSheet(
+            f"QPushButton {{ background: rgb({Theme.Accent.red()},{Theme.Accent.green()},{Theme.Accent.blue()});"
+            f" color: black; border: none; border-radius: 4px; padding: 6px 16px; }}")
+        ok.clicked.connect(self.accept)
+        btns.addWidget(cancel)
+        btns.addWidget(ok)
+        layout.addLayout(btns)
+
+    def result_credential(self) -> SavedCredential:
+        return SavedCredential(self._url.text().strip(),
+                               self._user.text().strip(),
+                               self._pwd.text())
+
+
+class CredentialManagerDialog(QDialog):
+    """Manage Passwords: list / add / edit / delete saved credentials."""
+
+    def __init__(self, manager: "PasswordManager", parent=None):
+        super().__init__(parent)
+        self._manager = manager
+        self.setWindowTitle("Manage Passwords")
+        self.setMinimumSize(560, 400)
+        self.setStyleSheet(
+            f"QDialog {{ background: rgb({Theme.ActiveTab.red()},{Theme.ActiveTab.green()},{Theme.ActiveTab.blue()}); color: white; }}")
+        layout = QVBoxLayout(self)
+        self._list = QListWidget()
+        self._list.setStyleSheet(
+            f"QListWidget {{ background: rgb({Theme.TitleBar.red()},{Theme.TitleBar.green()},{Theme.TitleBar.blue()});"
+            f"color: white; border: 1px solid rgb({Theme.Border.red()},{Theme.Border.green()},{Theme.Border.blue()}); }}"
+            f"QListWidget::item:selected {{ background: rgb({Theme.Accent.red()},{Theme.Accent.green()},{Theme.Accent.blue()}); color: black; }}")
+        self._list.itemDoubleClicked.connect(lambda _i: self._edit())
+        layout.addWidget(self._list, 1)
+        row = QHBoxLayout()
+        btn_style = (f"QPushButton {{ background: rgb({Theme.Toolbar.red()},{Theme.Toolbar.green()},{Theme.Toolbar.blue()});"
+                     f"color: white; border: none; border-radius: 4px; padding: 6px 14px; }}"
+                     f"QPushButton:hover {{ background: rgb({Theme.TabHover.red()},{Theme.TabHover.green()},{Theme.TabHover.blue()}); }}")
+        for label, slot in (("Add", self._add), ("Edit", self._edit), ("Delete", self._delete)):
+            b = QPushButton(label)
+            b.setStyleSheet(btn_style)
+            b.clicked.connect(slot)
+            row.addWidget(b)
+        row.addStretch(1)
+        close = QPushButton("Close")
+        close.setStyleSheet(
+            f"QPushButton {{ background: rgb({Theme.Accent.red()},{Theme.Accent.green()},{Theme.Accent.blue()});"
+            f" color: black; border: none; border-radius: 4px; padding: 6px 16px; }}")
+        close.clicked.connect(self.accept)
+        row.addWidget(close)
+        layout.addLayout(row)
+        self._reload()
+
+    def _reload(self):
+        self._list.clear()
+        for c in self._manager.passwords:
+            host = c.url
+            try:
+                host = urlparse(c.url).hostname or c.url
+            except Exception:
+                pass
+            self._list.addItem(f"{host}  -  {c.username}")
+
+    def _add(self):
+        dlg = CredentialEditDialog(None, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            c = dlg.result_credential()
+            if c.url and c.username:
+                self._manager.passwords.append(c)
+                self._manager.save()
+                self._reload()
+
+    def _edit(self):
+        idx = self._list.currentRow()
+        if not (0 <= idx < len(self._manager.passwords)):
+            return
+        cred = self._manager.passwords[idx]
+        dlg = CredentialEditDialog(cred, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            new = dlg.result_credential()
+            cred.url, cred.username, cred.password = new.url, new.username, new.password
+            self._manager.save()
+            self._reload()
+
+    def _delete(self):
+        idx = self._list.currentRow()
+        if not (0 <= idx < len(self._manager.passwords)):
+            return
+        del self._manager.passwords[idx]
+        self._manager.save()
+        self._reload()
+
+
+def _dialog_style() -> str:
+    return (
+        f"QDialog {{ background: rgb({Theme.ActiveTab.red()},{Theme.ActiveTab.green()},{Theme.ActiveTab.blue()}); color: white; }}"
+        f"QLabel {{ color: white; }}"
+        f"QLineEdit {{ background: rgb({Theme.AddressBox.red()},{Theme.AddressBox.green()},{Theme.AddressBox.blue()});"
+        f" color: white; border: 1px solid rgb({Theme.Border.red()},{Theme.Border.green()},{Theme.Border.blue()});"
+        f" border-radius: 4px; padding: 4px 8px; }}"
+    )
+
+
+def _accent_button(label: str) -> QPushButton:
+    b = QPushButton(label)
+    b.setStyleSheet(
+        f"QPushButton {{ background: rgb({Theme.Accent.red()},{Theme.Accent.green()},{Theme.Accent.blue()});"
+        f" color: black; border: none; border-radius: 4px; padding: 6px 16px; }}")
+    return b
+
+
+class CardEditDialog(QDialog):
+    def __init__(self, card: SavedCard | None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit Card" if card else "Add Card")
+        self.setMinimumWidth(380)
+        self.setStyleSheet(_dialog_style())
+        layout = QVBoxLayout(self)
+        self._fields = {}
+        for key, lbl, val in (
+            ("label", "Nickname", card.label if card else ""),
+            ("name", "Cardholder name", card.name if card else ""),
+            ("number", "Card number", card.number if card else ""),
+            ("exp_month", "Expiry month (MM)", card.exp_month if card else ""),
+            ("exp_year", "Expiry year (YYYY)", card.exp_year if card else ""),
+            ("cvc", "CVC", card.cvc if card else ""),
+        ):
+            layout.addWidget(QLabel(lbl))
+            edit = QLineEdit(val)
+            self._fields[key] = edit
+            layout.addWidget(edit)
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        ok = _accent_button("Save")
+        ok.clicked.connect(self._on_ok)
+        btns.addWidget(cancel)
+        btns.addWidget(ok)
+        layout.addLayout(btns)
+
+    def _on_ok(self):
+        num = re.sub(r"\D", "", self._fields["number"].text())
+        if len(num) < 12:
+            QMessageBox.warning(self, "GBrowser", "Enter a valid card number (12+ digits).")
+            return
+        self.accept()
+
+    def result_card(self) -> SavedCard:
+        f = self._fields
+        return SavedCard(f["label"].text().strip(), f["name"].text().strip(),
+                         f["number"].text().strip(), f["exp_month"].text().strip(),
+                         f["exp_year"].text().strip(), f["cvc"].text().strip())
+
+
+class AddressEditDialog(QDialog):
+    def __init__(self, addr: SavedAddress | None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit Address" if addr else "Add Address")
+        self.setMinimumWidth(400)
+        self.setStyleSheet(_dialog_style())
+        layout = QVBoxLayout(self)
+        self._fields = {}
+        for key, lbl in (
+            ("label", "Nickname"), ("full_name", "Full name"), ("email", "Email"),
+            ("phone", "Phone"), ("line1", "Address line 1"), ("line2", "Address line 2"),
+            ("city", "City"), ("state", "State / Region"), ("postal_code", "Postal code"),
+            ("country", "Country"),
+        ):
+            layout.addWidget(QLabel(lbl))
+            edit = QLineEdit(getattr(addr, key) if addr else "")
+            self._fields[key] = edit
+            layout.addWidget(edit)
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        ok = _accent_button("Save")
+        ok.clicked.connect(self.accept)
+        btns.addWidget(cancel)
+        btns.addWidget(ok)
+        layout.addLayout(btns)
+
+    def result_address(self) -> SavedAddress:
+        f = self._fields
+        return SavedAddress(f["label"].text().strip(), f["full_name"].text().strip(),
+                            f["email"].text().strip(), f["phone"].text().strip(),
+                            f["line1"].text().strip(), f["line2"].text().strip(),
+                            f["city"].text().strip(), f["state"].text().strip(),
+                            f["postal_code"].text().strip(), f["country"].text().strip())
+
+
+class _ListManagerDialog(QDialog):
+    """Shared list + Add/Edit/Delete UI for cards and addresses."""
+
+    def __init__(self, title: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumSize(560, 400)
+        self.setStyleSheet(
+            f"QDialog {{ background: rgb({Theme.ActiveTab.red()},{Theme.ActiveTab.green()},{Theme.ActiveTab.blue()}); color: white; }}")
+        layout = QVBoxLayout(self)
+        self._list = QListWidget()
+        self._list.setStyleSheet(
+            f"QListWidget {{ background: rgb({Theme.TitleBar.red()},{Theme.TitleBar.green()},{Theme.TitleBar.blue()});"
+            f"color: white; border: 1px solid rgb({Theme.Border.red()},{Theme.Border.green()},{Theme.Border.blue()}); }}"
+            f"QListWidget::item:selected {{ background: rgb({Theme.Accent.red()},{Theme.Accent.green()},{Theme.Accent.blue()}); color: black; }}")
+        self._list.itemDoubleClicked.connect(lambda _i: self._edit())
+        layout.addWidget(self._list, 1)
+        row = QHBoxLayout()
+        btn_style = (f"QPushButton {{ background: rgb({Theme.Toolbar.red()},{Theme.Toolbar.green()},{Theme.Toolbar.blue()});"
+                     f"color: white; border: none; border-radius: 4px; padding: 6px 14px; }}"
+                     f"QPushButton:hover {{ background: rgb({Theme.TabHover.red()},{Theme.TabHover.green()},{Theme.TabHover.blue()}); }}")
+        for label, slot in (("Add", self._add), ("Edit", self._edit), ("Delete", self._delete)):
+            b = QPushButton(label)
+            b.setStyleSheet(btn_style)
+            b.clicked.connect(slot)
+            row.addWidget(b)
+        row.addStretch(1)
+        close = _accent_button("Close")
+        close.clicked.connect(self.accept)
+        row.addWidget(close)
+        layout.addLayout(row)
+
+    # Subclasses implement these.
+    def _items(self) -> list: raise NotImplementedError
+    def _display(self, item) -> str: raise NotImplementedError
+    def _add(self): raise NotImplementedError
+    def _edit(self): raise NotImplementedError
+    def _delete(self): raise NotImplementedError
+
+    def _reload(self):
+        self._list.clear()
+        for it in self._items():
+            self._list.addItem(self._display(it))
+
+
+class CardManagerDialog(_ListManagerDialog):
+    def __init__(self, manager: "CardManager", parent=None):
+        self._manager = manager
+        super().__init__("Payment Methods", parent)
+        self._reload()
+
+    def _items(self): return self._manager.cards
+    def _display(self, item): return item.display
+
+    def _add(self):
+        dlg = CardEditDialog(None, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._manager.cards.append(dlg.result_card())
+            self._manager.save()
+            self._reload()
+
+    def _edit(self):
+        idx = self._list.currentRow()
+        if not (0 <= idx < len(self._manager.cards)):
+            return
+        dlg = CardEditDialog(self._manager.cards[idx], self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._manager.cards[idx] = dlg.result_card()
+            self._manager.save()
+            self._reload()
+
+    def _delete(self):
+        idx = self._list.currentRow()
+        if not (0 <= idx < len(self._manager.cards)):
+            return
+        del self._manager.cards[idx]
+        self._manager.save()
+        self._reload()
+
+
+class AddressManagerDialog(_ListManagerDialog):
+    def __init__(self, manager: "AddressManager", parent=None):
+        self._manager = manager
+        super().__init__("Addresses", parent)
+        self._reload()
+
+    def _items(self): return self._manager.addresses
+    def _display(self, item): return item.display
+
+    def _add(self):
+        dlg = AddressEditDialog(None, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._manager.addresses.append(dlg.result_address())
+            self._manager.save()
+            self._reload()
+
+    def _edit(self):
+        idx = self._list.currentRow()
+        if not (0 <= idx < len(self._manager.addresses)):
+            return
+        dlg = AddressEditDialog(self._manager.addresses[idx], self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._manager.addresses[idx] = dlg.result_address()
+            self._manager.save()
+            self._reload()
+
+    def _delete(self):
+        idx = self._list.currentRow()
+        if not (0 <= idx < len(self._manager.addresses)):
+            return
+        del self._manager.addresses[idx]
+        self._manager.save()
+        self._reload()
 
 
 class DownloadsPopup(QFrame):
@@ -1969,10 +2583,10 @@ class DownloadsPopup(QFrame):
             detail = f"{_format_bytes(dl.received)} / {_format_bytes(dl.total)}  ({pct}%)"
         elif dl.status == "Downloading":
             pct = 0
-            detail = f"{_format_bytes(dl.received)}  —  downloading"
+            detail = f"{_format_bytes(dl.received)}  -  downloading"
         else:
             pct = 100 if dl.status == "Complete" else 0
-            detail = f"{dl.status}  ·  {_format_bytes(dl.received or dl.total)}"
+            detail = f"{dl.status}  -  {_format_bytes(dl.received or dl.total)}"
         name = QLabel(dl.filename)
         name.setStyleSheet("font-size: 12px;")
         info = QLabel(detail)
@@ -2007,7 +2621,7 @@ class DownloadsPopup(QFrame):
         self.refresh()
 
 
-# Kill passkey / WebAuthn prompts on every site (Google, Microsoft, GitHub, …).
+# Kill passkey / WebAuthn prompts on every site (Google, Microsoft, GitHub, ...).
 DISABLE_PASSKEY_JS = r"""
 (function(){
   if (window.__gNoPasskey) return;
@@ -2061,8 +2675,240 @@ DISABLE_PASSKEY_JS = r"""
 """
 
 
+# Suppress Google One Tap / FedCM prompts (ported from Ceprkac 0.8.8 FedCmSuppressJs).
+# The FedCM credential UI ("Continue to <site> with google.com") fights the omnibox
+# for focus and, on some pages, drives an address-bar blink storm. GBrowser has its
+# own password manager, so the redundant Google prompt is neutralised. ONLY the FedCM
+# ({identity:...}) path is intercepted - passkeys ({publicKey:...}) and classic
+# Credential Management ({password:...}/{federated:...}) pass straight through, so the
+# passkey handling above is unaffected. Runs in the main world before page scripts.
+FEDCM_SUPPRESS_JS = r"""
+(function(){
+  if (window.__gNoFedCm) return;
+  window.__gNoFedCm = true;
+  try {
+    var creds = navigator.credentials;
+    if (creds && typeof creds.get === 'function') {
+      var origGet = creds.get.bind(creds);
+      creds.get = function(options){
+        try {
+          if (options && options.identity) {
+            return Promise.reject(new DOMException('FedCM disabled', 'NotAllowedError'));
+          }
+        } catch(e) {}
+        return origGet(options);
+      };
+    }
+  } catch(e) {}
+  try {
+    function neuter(){
+      try {
+        if (window.google && google.accounts && google.accounts.id) {
+          google.accounts.id.prompt = function(){};
+          google.accounts.id.renderButton = google.accounts.id.renderButton || function(){};
+        }
+      } catch(e) {}
+    }
+    var n = 0, iv = setInterval(function(){ neuter(); if (++n > 40) clearInterval(iv); }, 250);
+    neuter();
+  } catch(e) {}
+})();
+"""
+
+
+# Capture the real right-click target (ported from Ceprkac ContextCaptureJs).
+# QtWebEngine's contextMenuData() reports empty media URLs on Discord/CDN images,
+# CSS backgrounds, and in-page viewers, so Lens/reverse-image search never appears.
+# This runs in the main world at document creation and records the last right-click
+# target (image / video / link / selection) into window.__gbrowserLastCtx, which the
+# native contextMenuEvent reads before building its menu.
+CONTEXT_CAPTURE_JS = r"""
+(function(){
+  if (window.__gbrowserCtxCap) return;
+  window.__gbrowserCtxCap = true;
+  window.__gbrowserLastCtx = null;
+  function absUrl(u){
+    if(!u) return '';
+    try { return new URL(u, location.href).href; } catch(e){ return u; }
+  }
+  function mediaFrom(el){
+    if (!el || el===document || el===window) return null;
+    var tag = (el.tagName||'').toUpperCase();
+    if (tag==='IMG' || tag==='IMAGE' || tag==='PICTURE') {
+      var s = el.currentSrc || el.src || el.getAttribute('src') || '';
+      if (!s && tag==='PICTURE') {
+        var im = el.querySelector('img');
+        if (im) s = im.currentSrc || im.src || '';
+      }
+      if (s) return {kind:'image', src:absUrl(s)};
+    }
+    if (tag==='VIDEO' || tag==='AUDIO') {
+      var s2 = el.currentSrc || el.src || '';
+      if (!s2 && el.querySelector) {
+        var srcEl = el.querySelector('source');
+        if (srcEl) s2 = srcEl.src || srcEl.getAttribute('src') || '';
+      }
+      if (s2) return {kind:'video', src:absUrl(s2)};
+    }
+    if (tag==='A') {
+      var href = el.href || '';
+      var img = el.querySelector && el.querySelector('img,video');
+      if (img) {
+        var is = img.currentSrc || img.src || '';
+        if (is) return {kind: (img.tagName||'').toUpperCase()==='VIDEO' ? 'video' : 'image', src:absUrl(is), href:href};
+      }
+      if (href) return {kind:'link', href:href};
+    }
+    if (tag==='SOURCE' && el.parentElement) return mediaFrom(el.parentElement);
+    try {
+      var bg = (window.getComputedStyle(el).backgroundImage || '');
+      var m = /url\(\s*['"]?([^'")]+)['"]?\s*\)/i.exec(bg);
+      if (m && m[1] && m[1].indexOf('data:')!==0) return {kind:'image', src:absUrl(m[1])};
+    } catch(e){}
+    return null;
+  }
+  document.addEventListener('contextmenu', function(e){
+    var t = e.target;
+    var info = null;
+    for (var i=0; i<8 && t; i++) {
+      info = mediaFrom(t);
+      if (info) break;
+      t = t.parentElement;
+    }
+    var sel = '';
+    try { sel = (window.getSelection() && window.getSelection().toString()) || ''; } catch(x){}
+    window.__gbrowserLastCtx = {
+      kind: info ? info.kind : 'page',
+      src: info && info.src ? info.src : '',
+      href: info && info.href ? info.href : '',
+      sel: sel
+    };
+  }, true);
+})();
+"""
+
+_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg",
+                     ".avif", ".ico", ".tiff", ".jfif", ".heic")
+_VIDEO_EXTENSIONS = (".mp4", ".webm", ".mkv", ".mov", ".avi", ".m4v", ".ogv",
+                     ".mpeg", ".mpg", ".m3u8")
+_IMAGE_HOST_HINTS = (
+    "googleusercontent.com", "ggpht.com", "gstatic.com", "ytimg.com",
+    "twimg.com", "fbcdn.net", "cdninstagram.com", "pinimg.com",
+    "imgur.com", "wikimedia.org", "cloudinary.com", "imgix.net",
+    "akamaihd.net", "discordapp.net", "discordcdn.com", "discordapp.com",
+    "media.tenor.com", "giphy.com",
+)
+
+
+def _url_has_extension(url: str, exts: tuple) -> bool:
+    if not url:
+        return False
+    try:
+        path = urlparse(url).path.lower()
+    except Exception:
+        path = url.lower()
+    at = path.find("@")
+    if at > 0:
+        path = path[:at]
+    return any(path.endswith(e) for e in exts)
+
+
+def _looks_like_image_url(url: str) -> bool:
+    return _url_has_extension(url, _IMAGE_EXTENSIONS)
+
+
+def _looks_like_video_url(url: str) -> bool:
+    return _url_has_extension(url, _VIDEO_EXTENSIONS)
+
+
+def _looks_like_image_host(url: str) -> bool:
+    if not url:
+        return False
+    try:
+        u = urlparse(url)
+        host = (u.hostname or "").lower()
+        for h in _IMAGE_HOST_HINTS:
+            if host == h or host.endswith("." + h):
+                return True
+        path = (u.path or "").lower()
+        if any(p in path for p in ("/image", "/img/", "/thumb", "/photo",
+                                   "/media/", "/avatar", "/attachments/", "/icons/")):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+# Autofill-assist (ported from Ceprkac AutofillAssistJs). Watches login form submits
+# and posts the entered username/password back to the app over the QWebChannel bridge
+# so GBrowser can offer to save/update the credential (DPAPI store). Only fires on
+# submit - it does NOT re-offer on every focus (that had blocked typing in Ceprkac).
+AUTOFILL_ASSIST_JS = r"""
+(function(){
+  if (window.__gAutofillAssist) return;
+  window.__gAutofillAssist = true;
+  function send(msg){
+    try {
+      if (window.__gbridge && window.__gbridge.onPasswordSubmit) {
+        window.__gbridge.onPasswordSubmit(JSON.stringify(msg));
+      }
+    } catch(e) {}
+  }
+  function capture(form){
+    try {
+      var pw = form.querySelector('input[type="password"]');
+      if (!pw || !pw.value) return;
+      var user = form.querySelector(
+        'input[type="email"], input[name="email"], input[name="username"], ' +
+        'input[name="login"], input[name="user"], input[autocomplete="username"], ' +
+        'input[autocomplete="email"], input[type="text"]');
+      send({type:'password-submit', url: location.href,
+            username: user ? (user.value || '') : '', password: pw.value});
+    } catch(e) {}
+  }
+  document.addEventListener('submit', function(e){
+    if (e.target && e.target.tagName === 'FORM') capture(e.target);
+  }, true);
+  // SPA logins often don't fire a real submit - also catch Enter in a password field
+  // and clicks on likely submit buttons.
+  document.addEventListener('keydown', function(e){
+    try {
+      if (e.key === 'Enter' && e.target && e.target.type === 'password') {
+        var f = e.target.closest('form');
+        if (f) capture(f); else {
+          send({type:'password-submit', url: location.href, username:'', password: e.target.value});
+        }
+      }
+    } catch(x){}
+  }, true);
+})();
+"""
+
+
+class _AutofillBridge(QObject):
+    """QWebChannel bridge object exposed to pages as window.__gbridge."""
+
+    def __init__(self, browser):
+        super().__init__()
+        self._browser = browser
+
+    @pyqtSlot(str)
+    def onPasswordSubmit(self, raw: str):
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return
+        if data.get("type") != "password-submit":
+            return
+        password = data.get("password", "")
+        if not password:
+            return
+        self._browser._offer_save_password(
+            data.get("url", ""), data.get("username", ""), password)
+
+
 # Collapse reserved-height GPT/DFP slots (index.hr billboards etc.) after the
-# iframe is blocked — otherwise the page keeps a huge empty white band.
+# iframe is blocked - otherwise the page keeps a huge empty white band.
 GSEC_SLOT_COLLAPSE_JS = r"""
 (function(){
   var h=(location.hostname||'').toLowerCase();
@@ -2471,6 +3317,8 @@ class Browser(QMainWindow):
         self._bookmarks: list[BookmarkNode] = []
         self._history: list[str] = []
         self._passwords = PasswordManager()
+        self._cards = CardManager()
+        self._addresses = AddressManager()
         self._ad_blocker = AdBlockInterceptor()
         self._devtools_windows: list[QWebEngineView] = []
         self._download_windows: list[QWidget] = []
@@ -2480,6 +3328,12 @@ class Browser(QMainWindow):
         self._gsec_dir: str = ""
         self._media_always: dict = _load_media_permissions()
         self._media_session: dict[str, str] = {}
+        # Credential-offer suppression (Ceprkac parity):
+        #  - permanent: user clicked "Type password manually..."
+        #  - temporary: closed picker without choosing -> 20s cooldown (epoch seconds)
+        self._dismissed_credential_hosts: set[str] = set()
+        self._recently_closed_credential_hosts: dict[str, float] = {}
+        self._autofill_bridge = _AutofillBridge(self)
         self._downloads: list[DownloadItem] = _load_downloads()
         self._dl_popup: DownloadsPopup | None = None
         self._profile = QWebEngineProfile("GBrowserProfile", self)
@@ -2516,6 +3370,9 @@ class Browser(QMainWindow):
         self._profile.setUrlRequestInterceptor(self._ad_blocker)
         self._profile.downloadRequested.connect(self._on_download_requested)
         self._install_passkey_script()
+        self._install_fedcm_script()
+        self._install_context_capture_script()
+        self._install_autofill_assist_scripts()
 
         self._gsec_dir = _find_gsecurity_dir()
         _load_blocklist_file(_resource_path("blocklist.txt"))
@@ -2666,7 +3523,7 @@ class Browser(QMainWindow):
         self._bm_layout.setSpacing(4)
         layout.addWidget(self._bookmark_bar)
 
-        # Find bar (#6) — hidden by default
+        # Find bar (#6) - hidden by default
         self._find_bar = QWidget()
         self._find_bar.setStyleSheet(
             f"background: rgb({Theme.Toolbar.red()},{Theme.Toolbar.green()},{Theme.Toolbar.blue()}); padding: 2px 8px;")
@@ -2727,6 +3584,7 @@ class Browser(QMainWindow):
         QShortcut(QKeySequence("Ctrl+F"), self).activated.connect(self._toggle_find_bar)
         QShortcut(QKeySequence("Escape"), self).activated.connect(self._close_find_bar)
         QShortcut(QKeySequence("Ctrl+Shift+T"), self).activated.connect(self._restore_closed_tab)
+        QShortcut(QKeySequence("Ctrl+Shift+K"), self).activated.connect(self._duplicate_tab)
         # Zoom shortcuts (#7)
         QShortcut(QKeySequence("Ctrl++"), self).activated.connect(self._zoom_in)
         QShortcut(QKeySequence("Ctrl+="), self).activated.connect(self._zoom_in)
@@ -2839,6 +3697,16 @@ class Browser(QMainWindow):
             url = self._closed_tabs.pop()
             self._add_new_tab(url)
 
+    # === Duplicate tab (Ctrl+Shift+K, Ceprkac parity) ===
+    def _duplicate_tab(self):
+        tab = self._active_tab()
+        if not tab:
+            return
+        url = tab.url or self._home_url
+        if url.startswith("about:"):
+            url = self._home_url
+        self._add_new_tab(url, insert_after=self._active_tab_index)
+
     # === Ad block status in status bar (#22) ===
     def _update_ad_block_status(self):
         self._status_label.setText(
@@ -2864,14 +3732,22 @@ class Browser(QMainWindow):
             tab.url = url or self._home_url
         else:
             # Popup/OAuth: Chromium will navigate this page. Do not load() a
-            # second copy — that would break window.opener.
+            # second copy - that would break window.opener.
             tab.url = url or "about:blank"
             tab.is_popup = True
 
-        # Use custom BrowserPage for OAuth handling
-        tab.web_view = QWebEngineView()
+        # Use custom BrowserPage for OAuth handling + BrowserWebView for context menu
+        tab.web_view = BrowserWebView(browser_window=self)
         page = BrowserPage(self._profile, tab.web_view, browser_window=self)
         tab.web_view.setPage(page)
+
+        # QWebChannel bridge so login-form submits can offer to save the password.
+        try:
+            channel = QWebChannel(page)
+            channel.registerObject("__gbridgeObj", self._autofill_bridge)
+            page.setWebChannel(channel)
+        except Exception:
+            pass
 
         # Connect signals
         page.loadStarted.connect(lambda: self._on_load_started(tab))
@@ -2916,11 +3792,21 @@ class Browser(QMainWindow):
         self._address.setFocus(Qt.FocusReason.ShortcutFocusReason)
         self._address.selectAll()
 
+    def _set_address_text(self, url: str):
+        """Write the omnibox without disturbing an active user edit (Ceprkac
+        SetAddressText). Treats about:blank as empty and skips if unchanged."""
+        text = "" if (url or "").startswith("about:") else (url or "")
+        if self._address.hasFocus():
+            return
+        if self._address.text() == text:
+            return
+        self._address.setText(text)
+
     def _on_tab_clicked(self, index: int):
         if 0 <= index < len(self._tabs):
             self._active_tab_index = index
             self._web_panel.setCurrentWidget(self._tabs[index].web_view)
-            self._address.setText(self._tabs[index].url)
+            self._set_address_text(self._tabs[index].url)
             self._update_bookmark_star()
             self._update_window_title()
             # Apply per-tab zoom
@@ -2987,6 +3873,7 @@ class Browser(QMainWindow):
             self._update_ad_block_status()
         self._add_to_history(tab.url)
         self._try_autofill(tab)
+        self._try_checkout_autofill(tab)
 
         # Auto-close auth callback tabs (like Ceprkac)
         self._check_auto_close_auth_tab(tab)
@@ -3011,9 +3898,15 @@ class Browser(QMainWindow):
             elif getattr(tab, "_popup_had_page", False):
                 QTimer.singleShot(400, lambda t=tab: self._close_empty_popup(t))
         if tab == self._active_tab():
-            self._address.setText(tab.url)
+            # Don't let page-driven URL updates (SPA route changes, ad iframes,
+            # redirect chains) rewrite the omnibox while the user is typing in it -
+            # that reselects the text and, on focus-stealing pages, feeds a blink
+            # loop (Ceprkac 0.8.7/0.8.8 focus-loop breaker).
+            if not self._address.hasFocus() and not tab.focus_omnibox:
+                self._set_address_text(tab.url)
         # Re-trigger autofill for multi-step logins
         self._try_autofill(tab)
+        self._try_checkout_autofill(tab)
 
     def _close_empty_popup(self, tab: ChromeTab):
         if tab not in self._tabs or not tab.is_popup:
@@ -3134,11 +4027,84 @@ class Browser(QMainWindow):
             True,
         )
 
+    def _install_fedcm_script(self):
+        """Suppress Google One Tap / FedCM prompts (Ceprkac 0.8.8 parity).
+
+        Must run in the MAIN world so it can see the page's real
+        navigator.credentials - an isolated-world copy cannot patch it.
+        """
+        self._install_script(
+            "gbrowser-no-fedcm",
+            FEDCM_SUPPRESS_JS,
+            QWebEngineScript.ScriptWorldId.MainWorld,
+            QWebEngineScript.InjectionPoint.DocumentCreation,
+            True,
+        )
+
+    def _install_context_capture_script(self):
+        """Record the real right-click target for the native context menu."""
+        self._install_script(
+            "gbrowser-ctx-capture",
+            CONTEXT_CAPTURE_JS,
+            QWebEngineScript.ScriptWorldId.MainWorld,
+            QWebEngineScript.InjectionPoint.DocumentCreation,
+            True,
+        )
+
+    def _install_autofill_assist_scripts(self):
+        """Install the QWebChannel client + bridge bootstrap + the save-password
+        assist script (Ceprkac AutofillAssistJs) into the main world."""
+        # Read Qt's bundled qwebchannel.js client so window.QWebChannel exists.
+        qwc = ""
+        try:
+            from PyQt6.QtCore import QFile, QIODevice
+            f = QFile(":/qtwebchannel/qwebchannel.js")
+            if f.open(QIODevice.OpenModeFlag.ReadOnly):
+                qwc = bytes(f.readAll()).decode("utf-8", "ignore")
+                f.close()
+        except Exception:
+            qwc = ""
+        if not qwc:
+            # Cannot expose the bridge without the client; skip save-password wiring.
+            return
+        # qt.webChannelTransport is not guaranteed to exist in the main world at
+        # DocumentCreation, so poll for it (and for the QWebChannel client) instead
+        # of bailing once. Without this the bridge can silently never bind and
+        # save-password never fires.
+        bootstrap = (
+            "(function(){"
+            "var tries=0;"
+            "function bind(){"
+            "if(window.__gbridge)return;"
+            "if(typeof QWebChannel!=='undefined'&&window.qt&&qt.webChannelTransport){"
+            "try{new QWebChannel(qt.webChannelTransport,function(ch){"
+            "window.__gbridge=ch.objects.__gbridgeObj;});}catch(e){}"
+            "return;}"
+            "if(++tries<60)setTimeout(bind,100);"
+            "}"
+            "bind();"
+            "})();"
+        )
+        self._install_script(
+            "gbrowser-qwebchannel",
+            qwc + "\n" + bootstrap,
+            QWebEngineScript.ScriptWorldId.MainWorld,
+            QWebEngineScript.InjectionPoint.DocumentCreation,
+            True,
+        )
+        self._install_script(
+            "gbrowser-autofill-assist",
+            AUTOFILL_ASSIST_JS,
+            QWebEngineScript.ScriptWorldId.MainWorld,
+            QWebEngineScript.InjectionPoint.DocumentReady,
+            True,
+        )
+
     def _install_gsecurity_scripts(self):
         """Install GSecurity-Ad-Shield content/main-world scripts on the profile."""
         if not self._gsec_dir:
             return
-        # Never run Shield scripts on IdP hosts — they break Google Sign-In.
+        # Never run Shield scripts on IdP hosts - they break Google Sign-In.
         auth_prefix = (
             "(function(){var h=(location.hostname||'').toLowerCase();"
             "if(/accounts\\.google|accounts\\.youtube|myaccount\\.google|signin\\.google|"
@@ -3202,7 +4168,7 @@ class Browser(QMainWindow):
         Only close if this is clearly a popup-style auth tab (opened by createWindow),
         not the main tab the user is actively using."""
         # Disabled: auto-closing tabs during OAuth flows causes login failures
-        # (e.g. Reddit via Google OAuth — the callback page needs to finish processing)
+        # (e.g. Reddit via Google OAuth - the callback page needs to finish processing)
         pass
 
     def _on_download_requested(self, download):
@@ -3231,7 +4197,7 @@ class Browser(QMainWindow):
         self._downloads.append(dl_item)
         if len(self._downloads) > 40:
             self._downloads = self._downloads[-40:]
-        self._status_label.setText(f"Downloading {dl_item.filename}…")
+        self._status_label.setText(f"Downloading {dl_item.filename}...")
         self._refresh_dl_button()
         self._wire_download(download, dl_item)
         if self._dl_popup and self._dl_popup.isVisible():
@@ -3332,7 +4298,7 @@ class Browser(QMainWindow):
             pct = min(100, int(received * 100 / total))
             self._status_label.setText(
                 f"Downloading {dl_item.filename}: {_format_bytes(received)} / {_format_bytes(total)} ({pct}%)")
-            self._dl_btn.setToolTip(f"Downloads — {dl_item.filename} {pct}%")
+            self._dl_btn.setToolTip(f"Downloads - {dl_item.filename} {pct}%")
         else:
             self._status_label.setText(
                 f"Downloading {dl_item.filename}: {_format_bytes(received)}")
@@ -3380,7 +4346,7 @@ class Browser(QMainWindow):
         active = sum(1 for d in self._downloads if d.status == "Downloading")
         if active:
             self._dl_btn.setText(f"\u2913 {active}")
-            self._dl_btn.setToolTip(f"Downloads — {active} in progress")
+            self._dl_btn.setToolTip(f"Downloads - {active} in progress")
         else:
             self._dl_btn.setText("\u2913")
             self._dl_btn.setToolTip("Downloads")
@@ -3400,7 +4366,7 @@ class Browser(QMainWindow):
         self._toggle_downloads_popup()
 
     def _inject_ad_hider(self, page):
-        """Inject ad blocking scripts — matches Ceprkac's InjectAdElementHider + InjectMainWorldBlocker."""
+        """Inject ad blocking scripts - matches Ceprkac's InjectAdElementHider + InjectMainWorldBlocker."""
         try:
             url = page.url().toString()
             page_host = urlparse(url).hostname or ""
@@ -3426,108 +4392,556 @@ class Browser(QMainWindow):
             return
         page.runJavaScript(AD_ELEMENT_HIDER_JS)
 
-    def _try_autofill(self, tab: ChromeTab):
-        now = time.time()
-        if now - tab.last_autofill_attempt < 3:
-            return
-        tab.last_autofill_attempt = now
+    # === Credential-offer suppression (Ceprkac parity) ===
+    def _credential_host(self, url: str) -> str:
+        try:
+            return (urlparse(url).hostname or url).lower()
+        except Exception:
+            return (url or "").lower()
 
+    def _is_credential_offer_dismissed(self, url: str) -> bool:
+        """Permanent dismiss ('Type password manually') OR a live 20s cooldown
+        from an accidental click-away close."""
+        host = self._credential_host(url)
+        if not host:
+            return False
+        if host in self._dismissed_credential_hosts:
+            return True
+        until = self._recently_closed_credential_hosts.get(host)
+        if until is not None:
+            if time.time() < until:
+                return True
+            del self._recently_closed_credential_hosts[host]
+        return False
+
+    def _dismiss_credential_offer(self, url: str):
+        host = self._credential_host(url)
+        if host:
+            self._dismissed_credential_hosts.add(host)
+
+    def _temporarily_suppress_credential_offer(self, url: str):
+        host = self._credential_host(url)
+        if host:
+            self._recently_closed_credential_hosts[host] = time.time() + 20
+
+    def _try_autofill(self, tab: ChromeTab):
         if not self._passwords.passwords:
             return
 
         try:
-            domain = urlparse(tab.url).hostname
+            page_url = tab.url or ""
+            domain = urlparse(page_url).hostname
             if not domain:
                 return
             domain = domain.lower()
         except Exception:
             return
 
+        # Per-URL de-dupe (Ceprkac 0.8.0): if a loop is already running for THIS
+        # exact URL, skip. A genuinely different URL (identifier -> password step)
+        # always proceeds even mid-loop; the older loop self-cancels when it sees
+        # the URL move on. A same-URL non-running attempt is 3s-debounced.
+        now = time.time()
+        if tab.autofill_in_progress and tab.last_autofill_url == page_url:
+            return
+        if (not tab.autofill_in_progress and tab.last_autofill_url == page_url
+                and now - tab.last_autofill_attempt < 3):
+            return
+
         # Phone 2FA / OAuth consent pages often have leftover password fields.
         # Filling them submits a malformed request (Google HTTP 400) even though
         # the authenticator tap already signed the user in.
-        if _is_idp_challenge_url(tab.url):
+        if _is_idp_challenge_url(page_url):
             return
 
         matches = self._passwords.get_matches(domain)
         if not matches:
             return
 
-        path_lower = urlparse(tab.url).path.lower() + (urlparse(tab.url).query or "").lower()
+        # User chose "type manually" (or accidental click-away cooldown) for this host.
+        if self._is_credential_offer_dismissed(page_url):
+            return
+
+        path_lower = urlparse(page_url).path.lower() + (urlparse(page_url).query or "").lower()
         is_login_page = any(kw in path_lower for kw in
                             ["login", "signin", "sign-in", "auth", "account", "sso",
-                             "register", "signup", "sign-up"])
+                             "register", "signup", "sign-up", "challenge", "pwd",
+                             "identifier", "session", "oauth", "passwd"])
 
-        self._autofill_attempt(tab, matches, is_login_page, 0, domain)
+        # Claim this URL up front with a fresh token so a concurrent
+        # loadFinished/urlChanged pair does not run two loops against the same page.
+        tab.last_autofill_attempt = now
+        tab.last_autofill_url = page_url
+        tab.autofill_in_progress = True
+        tab.autofill_token += 1
+        self._autofill_attempt(tab, matches, is_login_page, 0, domain,
+                               page_url, tab.autofill_token)
 
     def _autofill_attempt(self, tab: ChromeTab, matches: list[SavedCredential],
-                          is_login_page: bool, attempt: int, domain: str):
-        if attempt >= 6:
+                          is_login_page: bool, attempt: int, domain: str,
+                          page_url: str, token: int):
+        # Self-cancel if superseded by a newer invocation, or the page navigated on.
+        if tab.autofill_token != token:
             return
-        delay = 800 + attempt * 600
+        if tab not in self._tabs or tab.web_view is None or tab.url != page_url:
+            if tab.autofill_token == token:
+                tab.autofill_in_progress = False
+            return
+        if attempt >= 8:
+            if tab.autofill_token == token:
+                tab.autofill_in_progress = False
+            return
+        delay = 400 if attempt == 0 else (600 + attempt * 450)
 
         def do_check():
-            # Tab-alive guard (fix #4)
-            if tab not in self._tabs or tab.web_view is None:
+            # Tab-alive + still-current guard
+            if tab.autofill_token != token:
+                return
+            if tab not in self._tabs or tab.web_view is None or tab.url != page_url:
+                if tab.autofill_token == token:
+                    tab.autofill_in_progress = False
                 return
             if not tab.web_view.page():
+                if tab.autofill_token == token:
+                    tab.autofill_in_progress = False
                 return
             tab.web_view.page().runJavaScript(CHECK_LOGIN_FIELDS_JS, 0,
-                lambda result: self._handle_field_check(tab, matches, is_login_page, attempt, domain, result))
+                lambda result: self._handle_field_check(
+                    tab, matches, is_login_page, attempt, domain, page_url, token, result))
 
         QTimer.singleShot(delay, do_check)
 
     def _handle_field_check(self, tab: ChromeTab, matches: list[SavedCredential],
-                            is_login_page: bool, attempt: int, domain: str, result):
-        if not result:
+                            is_login_page: bool, attempt: int, domain: str,
+                            page_url: str, token: int, result):
+        # Self-cancel / tab-alive / still-current guards
+        if tab.autofill_token != token:
             return
-        # Tab-alive guard (fix #4)
-        if tab not in self._tabs or tab.web_view is None:
+        if tab not in self._tabs or tab.web_view is None or tab.url != page_url:
+            if tab.autofill_token == token:
+                tab.autofill_in_progress = False
             return
         field_status = result.strip('"') if isinstance(result, str) else str(result)
 
         if field_status == "none":
-            self._autofill_attempt(tab, matches, is_login_page, attempt + 1, domain)
+            self._autofill_attempt(tab, matches, is_login_page, attempt + 1,
+                                   domain, page_url, token)
             return
 
-        if field_status == "useronly" and not is_login_page:
-            return
+        # From here we are done with the loop for this page.
+        if tab.autofill_token == token:
+            tab.autofill_in_progress = False
 
-        if field_status in ("both", "pwonly"):
+        if field_status == "pwonly":
+            # A password field present means this is a login step regardless of the
+            # URL path - this is what makes Google's separate password page work.
             if len(matches) == 1:
-                js = _make_fill_js(matches[0].username, matches[0].password)
-                tab.web_view.page().runJavaScript(js)
+                tab.web_view.page().runJavaScript(_make_fill_password_js(matches[0].password))
+                self._status_label.setText(f"Auto-filled password for {domain}")
+            else:
+                self._show_credential_picker(tab, matches, password_only=True)
+            return
+
+        if field_status == "both":
+            if len(matches) == 1:
+                tab.web_view.page().runJavaScript(
+                    _make_fill_js(matches[0].username, matches[0].password))
                 self._status_label.setText(f"Auto-filled credentials for {domain}")
             else:
                 self._show_credential_picker(tab, matches)
             return
 
         if field_status == "useronly":
-            if len(matches) == 1:
-                js = _make_fill_username_js(matches[0].username)
-                tab.web_view.page().runJavaScript(js)
-                self._status_label.setText(f"Filled username for {domain}")
+            # Auto-fill silently only on login-like paths with a single match;
+            # otherwise always show the picker.
+            if len(matches) == 1 and is_login_page:
+                tab.web_view.page().runJavaScript(_make_fill_username_js(matches[0].username))
+                self._status_label.setText(f"Filled username for {domain} (continue to password)")
             else:
                 self._show_credential_picker(tab, matches)
 
-    def _show_credential_picker(self, tab: ChromeTab, matches: list[SavedCredential]):
+    def _show_credential_picker(self, tab: ChromeTab, matches: list[SavedCredential],
+                                password_only: bool = False):
+        if not matches:
+            return
+        page_url = tab.url or ""
+        if self._is_credential_offer_dismissed(page_url):
+            return
+        # Non-modal QMenu (Ceprkac never uses a modal dialog here so the page stays
+        # usable). Track whether the user actually chose something.
+        state = {"chose": False}
         menu = QMenu(self)
         menu.setStyleSheet(
             f"QMenu {{ background: rgb({Theme.ActiveTab.red()},{Theme.ActiveTab.green()},{Theme.ActiveTab.blue()});"
             f"color: white; }} QMenu::item:selected {{ background: rgb({Theme.TabHover.red()},{Theme.TabHover.green()},{Theme.TabHover.blue()}); }}")
-        header = menu.addAction("Select account:")
+        header = menu.addAction("Choose a password:" if password_only else "Choose an account:")
         header.setEnabled(False)
         menu.addSeparator()
         for cred in matches:
-            action = menu.addAction(cred.username)
-            action.triggered.connect(lambda checked, c=cred: self._fill_selected_credential(tab, c))
-        menu.exec(self._web_panel.mapToGlobal(QPoint(self._web_panel.width() // 2 - 80, 10)))
+            host = cred.url
+            try:
+                host = urlparse(cred.url).hostname or cred.url
+            except Exception:
+                pass
+            action = menu.addAction(f"{cred.username}  ({host})")
+            action.triggered.connect(
+                lambda checked=False, c=cred: self._fill_selected_credential(
+                    tab, c, password_only, state))
+        menu.addSeparator()
+        dismiss = menu.addAction("Type password manually...")
+        dismiss.triggered.connect(lambda checked=False: self._on_credential_dismiss(tab, page_url, state))
 
-    def _fill_selected_credential(self, tab: ChromeTab, cred: SavedCredential):
+        def on_close():
+            # Closed without picking -> 20s cooldown so an accidental click-away
+            # does not permanently hide the picker for this session.
+            if not state["chose"]:
+                self._temporarily_suppress_credential_offer(page_url)
+        menu.aboutToHide.connect(on_close)
+
+        menu.exec(self._web_panel.mapToGlobal(QPoint(max(8, self._web_panel.width() // 2 - 80), 10)))
+
+    def _on_credential_dismiss(self, tab: ChromeTab, page_url: str, state: dict):
+        state["chose"] = True
+        self._dismiss_credential_offer(page_url)
+        if tab.web_view:
+            tab.web_view.setFocus()
+
+    def _fill_selected_credential(self, tab: ChromeTab, cred: SavedCredential,
+                                  password_only: bool = False, state: dict = None):
+        if state is not None:
+            state["chose"] = True
         if tab.web_view and tab.web_view.page():
-            js = _make_fill_js(cred.username, cred.password)
-            tab.web_view.page().runJavaScript(js)
-            self._status_label.setText(f"Filled credentials for {cred.username}")
+            try:
+                if password_only:
+                    tab.web_view.page().runJavaScript(_make_fill_password_js(cred.password))
+                    self._status_label.setText(f"Filled password for {cred.username}")
+                else:
+                    tab.web_view.page().runJavaScript(_make_fill_js(cred.username, cred.password))
+                    self._status_label.setText(f"Filled credentials for {cred.username}")
+            except Exception as ex:
+                self._status_label.setText(f"Autofill error: {ex}")
+
+    # === Save-password prompt (Ceprkac OfferSavePassword) ===
+    def _offer_save_password(self, url: str, username: str, password: str):
+        if not password:
+            return
+        if not url:
+            tab = self._active_tab()
+            url = tab.url if tab else ""
+        if not url:
+            return
+        try:
+            host = urlparse(url).hostname or ""
+        except Exception:
+            return
+        if not host:
+            return
+        # Already saved identical credentials? Do nothing.
+        existing = self._passwords.find_exact(host.lower(), username)
+        if existing is not None and existing.password == password:
+            return
+        who = f" ({username})" if username else ""
+        if existing is None:
+            msg = f"Save password for {host}{who}?"
+        else:
+            msg = f"Update saved password for {host}{who}?"
+        reply = QMessageBox.question(
+            self, "GBrowser", msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self._passwords.add_or_update(url, username, password)
+        self._status_label.setText(f"Password saved for {host}.")
+
+    def _manage_passwords(self):
+        dlg = CredentialManagerDialog(self._passwords, self)
+        dlg.exec()
+        self._status_label.setText("Passwords updated.")
+
+    # === Checkout autofill: payment methods + addresses (Ceprkac 0.7.8) ===
+    def _try_checkout_autofill(self, tab: ChromeTab):
+        if not self._cards.cards and not self._addresses.addresses:
+            return
+        page_url = tab.url or ""
+        if not page_url or page_url.startswith("about:"):
+            return
+        now = time.time()
+        # Per-URL de-dupe mirroring the password path: skip if a loop is already
+        # running for this URL, or a same-URL non-running attempt within 3s.
+        if tab.checkout_in_progress and tab.last_checkout_url == page_url:
+            return
+        if (not tab.checkout_in_progress and tab.last_checkout_url == page_url
+                and now - tab.last_checkout_attempt < 3):
+            return
+        tab.last_checkout_attempt = now
+        tab.last_checkout_url = page_url
+        tab.checkout_in_progress = True
+        tab.checkout_token += 1
+        looks_checkout = any(k in page_url.lower() for k in
+                             ("checkout", "payment", "billing", "shipping", "address",
+                              "cart", "order", "/pay"))
+        self._checkout_attempt(tab, page_url, looks_checkout, 0, tab.checkout_token)
+
+    def _checkout_attempt(self, tab: ChromeTab, page_url: str, looks_checkout: bool,
+                          attempt: int, token: int):
+        if tab.checkout_token != token:
+            return
+        if tab not in self._tabs or tab.web_view is None or tab.url != page_url or attempt >= 4:
+            if tab.checkout_token == token:
+                tab.checkout_in_progress = False
+            return
+        delay = 700 + attempt * 500
+
+        def do_check():
+            if tab.checkout_token != token:
+                return
+            if tab not in self._tabs or tab.web_view is None or tab.url != page_url:
+                if tab.checkout_token == token:
+                    tab.checkout_in_progress = False
+                return
+            page = tab.web_view.page()
+            if not page:
+                if tab.checkout_token == token:
+                    tab.checkout_in_progress = False
+                return
+            page.runJavaScript(CHECKOUT_DETECT_JS, 0,
+                lambda res: self._handle_checkout_check(tab, page_url, looks_checkout, attempt, token, res))
+
+        QTimer.singleShot(delay, do_check)
+
+    def _handle_checkout_check(self, tab: ChromeTab, page_url: str, looks_checkout: bool,
+                               attempt: int, token: int, result):
+        if tab.checkout_token != token:
+            return
+        if tab not in self._tabs or tab.web_view is None or tab.url != page_url:
+            if tab.checkout_token == token:
+                tab.checkout_in_progress = False
+            return
+        status = result.strip('"') if isinstance(result, str) else str(result or "")
+        has_card = status.startswith("card")
+        has_addr = status.endswith("addr")
+        if not has_card and not has_addr:
+            if looks_checkout:
+                self._checkout_attempt(tab, page_url, looks_checkout, attempt + 1, token)
+            elif tab.checkout_token == token:
+                tab.checkout_in_progress = False
+            return
+        # Found fields -> loop is done.
+        if tab.checkout_token == token:
+            tab.checkout_in_progress = False
+        page = tab.web_view.page()
+        filled = False
+        if has_addr and self._addresses.addresses:
+            if len(self._addresses.addresses) == 1:
+                page.runJavaScript(_make_fill_address_js(self._addresses.addresses[0]))
+                filled = True
+            else:
+                self._show_address_picker(tab)
+        if has_card and self._cards.cards:
+            if len(self._cards.cards) == 1:
+                page.runJavaScript(_make_fill_card_js(self._cards.cards[0]))
+                filled = True
+            else:
+                self._show_card_picker(tab)
+        if filled:
+            self._status_label.setText("Autofilled saved details.")
+
+    def _show_card_picker(self, tab: ChromeTab):
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            f"QMenu {{ background: rgb({Theme.ActiveTab.red()},{Theme.ActiveTab.green()},{Theme.ActiveTab.blue()});"
+            f"color: white; }} QMenu::item:selected {{ background: rgb({Theme.TabHover.red()},{Theme.TabHover.green()},{Theme.TabHover.blue()}); }}")
+        header = menu.addAction("Choose a card:")
+        header.setEnabled(False)
+        menu.addSeparator()
+        for card in self._cards.cards:
+            menu.addAction(card.display,
+                           lambda checked=False, c=card: self._fill_card(tab, c))
+        menu.exec(self._web_panel.mapToGlobal(QPoint(max(8, self._web_panel.width() // 2 - 100), 10)))
+
+    def _fill_card(self, tab: ChromeTab, card: SavedCard):
+        if tab.web_view and tab.web_view.page():
+            tab.web_view.page().runJavaScript(_make_fill_card_js(card))
+            self._status_label.setText(f"Filled card ---- {card.last4}")
+
+    def _show_address_picker(self, tab: ChromeTab):
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            f"QMenu {{ background: rgb({Theme.ActiveTab.red()},{Theme.ActiveTab.green()},{Theme.ActiveTab.blue()});"
+            f"color: white; }} QMenu::item:selected {{ background: rgb({Theme.TabHover.red()},{Theme.TabHover.green()},{Theme.TabHover.blue()}); }}")
+        header = menu.addAction("Choose an address:")
+        header.setEnabled(False)
+        menu.addSeparator()
+        for addr in self._addresses.addresses:
+            menu.addAction(addr.display,
+                           lambda checked=False, a=addr: self._fill_address(tab, a))
+        menu.exec(self._web_panel.mapToGlobal(QPoint(max(8, self._web_panel.width() // 2 - 100), 10)))
+
+    def _fill_address(self, tab: ChromeTab, addr: SavedAddress):
+        if tab.web_view and tab.web_view.page():
+            tab.web_view.page().runJavaScript(_make_fill_address_js(addr))
+            self._status_label.setText(f"Filled address for {addr.full_name}")
+
+    def _manage_cards(self):
+        dlg = CardManagerDialog(self._cards, self)
+        dlg.exec()
+
+    def _manage_addresses(self):
+        dlg = AddressManagerDialog(self._addresses, self)
+        dlg.exec()
+
+    def _set_as_default_browser(self):
+        if sys.platform != "win32":
+            QMessageBox.information(self, "GBrowser",
+                                    "Default-browser registration is only supported on Windows.")
+            return
+        ok = _register_browser()
+        if ok:
+            _open_default_apps_settings()
+            self._status_label.setText("Registered - confirm GBrowser as default in Settings.")
+        else:
+            QMessageBox.warning(self, "GBrowser", "Could not register GBrowser as a browser.")
+
+    def open_external_url(self, url: str):
+        """Open a URL forwarded from a second launch (single-instance)."""
+        if not url:
+            self.raise_()
+            self.activateWindow()
+            return
+        self._add_new_tab(url)
+        self.raise_()
+        self.activateWindow()
+
+    # === Context menu (right-click image/video/link search - Ceprkac parity) ===
+    def _search_host(self) -> str:
+        try:
+            return urlparse(self._search_template.format("x")).hostname.lower()
+        except Exception:
+            return ""
+
+    def _search_engine_name(self) -> str:
+        for name, _, search in SEARCH_ENGINES:
+            if search.lower() == self._search_template.lower():
+                return name
+        host = self._search_host().replace("www.", "")
+        return host or "web"
+
+    def _build_text_search_url(self, query: str) -> str:
+        return self._search_template.format(quote_plus(query))
+
+    def _build_image_search_url(self, image_url: str) -> str:
+        host = self._search_host()
+        enc = quote_plus(image_url)
+        if "google." in host:
+            return "https://lens.google.com/uploadbyurl?url=" + enc
+        if "bing." in host:
+            return "https://www.bing.com/images/search?q=imgurl:" + enc + "&view=detailv2&iss=sbi"
+        if "yandex." in host:
+            return "https://yandex.com/images/search?rpt=imageview&url=" + enc
+        return "https://lens.google.com/uploadbyurl?url=" + enc
+
+    def _build_video_search_url(self, video_url: str) -> str:
+        host = self._search_host()
+        enc = quote_plus(video_url)
+        if "google." in host:
+            return "https://www.google.com/search?q=" + enc + "&tbm=vid"
+        if "bing." in host:
+            return "https://www.bing.com/videos/search?q=" + enc
+        return self._build_text_search_url(video_url)
+
+    def _build_context_menu(self, view: "BrowserWebView", raw):
+        """Build the right-click menu from the JS-captured target (Ceprkac AddSearchMenuItems)."""
+        # The tab may have been closed during the async runJavaScript hop; touching a
+        # deleted view/page would be a use-after-free.
+        if not any(t.web_view is view for t in self._tabs):
+            return
+        kind, src, href, sel = "page", "", "", ""
+        try:
+            if raw and raw != "null":
+                data = json.loads(raw)
+                kind = data.get("kind", "page")
+                src = data.get("src", "") or ""
+                href = data.get("href", "") or ""
+                sel = data.get("sel", "") or ""
+        except Exception:
+            pass
+
+        page = view.page()
+        engine = self._search_engine_name()
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            f"QMenu {{ background: rgb({Theme.ActiveTab.red()},{Theme.ActiveTab.green()},{Theme.ActiveTab.blue()});"
+            f"color: white; }} QMenu::item:selected {{ background: rgb({Theme.TabHover.red()},{Theme.TabHover.green()},{Theme.TabHover.blue()}); }}"
+            f"QMenu::separator {{ background: rgb({Theme.Border.red()},{Theme.Border.green()},{Theme.Border.blue()}); height: 1px; }}")
+
+        added = False
+
+        def add_open(label: str, url: str):
+            nonlocal added
+            if not url:
+                return
+            menu.addAction(label, lambda checked=False, u=url: self._add_new_tab(u))
+            added = True
+
+        def add_copy(label: str, text: str):
+            nonlocal added
+            if not text:
+                return
+            menu.addAction(label, lambda checked=False, t=text: self._copy_to_clipboard(t))
+            added = True
+
+        sel = (sel or "").strip()
+        if sel:
+            shown = (sel[:40] + "...") if len(sel) > 40 else sel
+            add_open(f'Search {engine} for "{shown}"', self._build_text_search_url(sel))
+
+        media_uri = src or href
+        is_image = (kind == "image" or _looks_like_image_url(src) or _looks_like_image_url(href)
+                    or _looks_like_image_host(src) or _looks_like_image_host(href))
+        is_video = (kind == "video" or _looks_like_video_url(src) or _looks_like_video_url(href))
+
+        if is_image and media_uri:
+            add_open("Search image with Google Lens",
+                     "https://lens.google.com/uploadbyurl?url=" + quote_plus(media_uri))
+            if "google." not in self._search_host():
+                add_open(f"Search {engine} for this image", self._build_image_search_url(media_uri))
+            add_open("Open image in new tab", media_uri)
+            add_copy("Copy image address", media_uri)
+        elif is_video and media_uri:
+            add_open(f"Search {engine} for this video", self._build_video_search_url(media_uri))
+            add_open("Open media in new tab", media_uri)
+            add_copy("Copy media address", media_uri)
+        elif href and not sel:
+            add_open("Open link in new tab", href)
+            add_copy("Copy link address", href)
+
+        if added:
+            menu.addSeparator()
+
+        # Standard navigation / edit actions from the page itself.
+        if page:
+            for act_enum in (QWebEnginePage.WebAction.Back, QWebEnginePage.WebAction.Forward,
+                             QWebEnginePage.WebAction.Reload):
+                act = page.action(act_enum)
+                if act and act.isEnabled():
+                    menu.addAction(act)
+            menu.addSeparator()
+            for act_enum in (QWebEnginePage.WebAction.Copy, QWebEnginePage.WebAction.Paste,
+                             QWebEnginePage.WebAction.SelectAll):
+                act = page.action(act_enum)
+                if act and act.isEnabled():
+                    menu.addAction(act)
+
+        if menu.isEmpty():
+            return
+        menu.exec(QCursor.pos())
+
+    def _copy_to_clipboard(self, text: str):
+        try:
+            QApplication.clipboard().setText(text)
+            self._status_label.setText("Copied.")
+        except Exception:
+            pass
 
     def _toggle_bookmark(self):
         tab = self._active_tab()
@@ -3783,6 +5197,7 @@ class Browser(QMainWindow):
             f"QMenu::separator {{ background: rgb({Theme.Border.red()},{Theme.Border.green()},{Theme.Border.blue()}); height: 1px; }}")
 
         menu.addAction("New Tab (Ctrl+T)", lambda: self._add_new_tab(self._home_url))
+        menu.addAction("Duplicate Tab (Ctrl+Shift+K)", self._duplicate_tab)
         menu.addAction("Restore Closed Tab (Ctrl+Shift+T)", self._restore_closed_tab)
         menu.addSeparator()
         menu.addAction("Find in Page (Ctrl+F)", self._toggle_find_bar)
@@ -3797,11 +5212,16 @@ class Browser(QMainWindow):
         menu.addSeparator()
         menu.addAction("Downloads...", self._show_downloads)
         menu.addSeparator()
+        menu.addAction("Manage Passwords...", self._manage_passwords)
         menu.addAction("Import Passwords (CSV)...", self._import_passwords_csv)
         menu.addAction("Clear Saved Passwords", self._clear_passwords)
         menu.addSeparator()
+        menu.addAction("Payment Methods...", self._manage_cards)
+        menu.addAction("Addresses...", self._manage_addresses)
+        menu.addSeparator()
         menu.addAction("DevTools (Ctrl+I)", self._open_devtools)
         menu.addAction("Change Search Engine...", self._show_search_engine_picker)
+        menu.addAction("Set as Default Browser...", self._set_as_default_browser)
         menu.addSeparator()
         menu.addAction("Exit", self.close)
 
@@ -3910,12 +5330,123 @@ def _resource_path(filename: str) -> str:
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
 
 
+# === DEFAULT-BROWSER REGISTRATION (Windows, ported from BrowserRegistration.cs) ===
+_APP_NAME = "GBrowser"
+_URL_PROGID = "GBrowserURL"
+_HTML_PROGID = "GBrowserHTML"
+_URL_PROTOCOLS = ("http", "https")
+_HTML_EXTS = (".htm", ".html", ".shtml", ".xhtml", ".xht", ".mht", ".mhtml")
+_SINGLE_INSTANCE_KEY = "GBrowser_SingleInstance"
+
+
+def _exe_launch_command() -> tuple[str, str]:
+    """Return (command_with_arg, open_command) for the registry, handling both a
+    frozen .exe and a `python GBrowser.py` dev run."""
+    if getattr(sys, "frozen", False):
+        exe = sys.executable
+        return f'"{exe}" "%1"', f'"{exe}"'
+    exe = sys.executable  # python
+    script = os.path.abspath(__file__)
+    return f'"{exe}" "{script}" "%1"', f'"{exe}" "{script}"'
+
+
+def _register_browser() -> bool:
+    """Write StartMenuInternet / ProgId / RegisteredApplications entries under HKCU
+    so GBrowser appears in Windows 'Default apps'. Returns True on success."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+    except Exception:
+        return False
+    cmd, open_cmd = _exe_launch_command()
+    icon = _resource_path("GBrowser.ico") + ",0"
+
+    def set_val(root, path, name, value):
+        with winreg.CreateKey(root, path) as k:
+            winreg.SetValueEx(k, name, 0, winreg.REG_SZ, value)
+
+    try:
+        hkcu = winreg.HKEY_CURRENT_USER
+        root = r"Software\Clients\StartMenuInternet\GBrowser"
+        set_val(hkcu, root, "", _APP_NAME)
+        set_val(hkcu, root, "LocalizedString", _APP_NAME)
+        set_val(hkcu, root + r"\DefaultIcon", "", icon)
+        set_val(hkcu, root + r"\shell\open\command", "", open_cmd)
+        caps = root + r"\Capabilities"
+        set_val(hkcu, caps, "ApplicationName", _APP_NAME)
+        set_val(hkcu, caps, "ApplicationIcon", icon)
+        set_val(hkcu, caps, "ApplicationDescription", "GBrowser web browser")
+        set_val(hkcu, root + r"\Capabilities\StartMenu", "StartMenuInternet", _APP_NAME)
+        for p in _URL_PROTOCOLS:
+            set_val(hkcu, caps + r"\URLAssociations", p, _URL_PROGID)
+        for ext in _HTML_EXTS:
+            set_val(hkcu, caps + r"\FileAssociations", ext, _HTML_PROGID)
+        set_val(hkcu, caps + r"\MimeAssociations", "text/html", _HTML_PROGID)
+
+        # ProgIds
+        for progid, friendly, is_url in (
+            (_URL_PROGID, "GBrowser URL", True),
+            (_HTML_PROGID, "GBrowser HTML Document", False),
+        ):
+            base = r"Software\Classes\\" + progid
+            set_val(hkcu, base, "", friendly)
+            if is_url:
+                set_val(hkcu, base, "URL Protocol", "")
+            set_val(hkcu, base + r"\DefaultIcon", "", icon)
+            set_val(hkcu, base + r"\shell\open\command", "", cmd)
+
+        set_val(hkcu, r"Software\RegisteredApplications", _APP_NAME,
+                r"Software\Clients\StartMenuInternet\GBrowser\Capabilities")
+
+        # Notify the shell that associations changed.
+        try:
+            from ctypes import windll
+            windll.shell32.SHChangeNotify(0x08000000, 0, None, None)
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def _open_default_apps_settings():
+    if sys.platform != "win32":
+        return
+    for target in (f"ms-settings:defaultapps?registeredAppUser={_APP_NAME}",
+                   "ms-settings:defaultapps"):
+        try:
+            os.startfile(target)
+            return
+        except Exception:
+            continue
+
+
 if __name__ == "__main__":
     # QTWEBENGINE_CHROMIUM_FLAGS is set at import time (before QtWebEngine loads).
 
     # Note: GPU acceleration is enabled by default for best performance.
     # If you encounter crashes in VMs or headless environments, uncomment:
     # os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu --no-sandbox")
+
+    # Parse CLI: --register-browser registers and exits; other non-flag args are URLs.
+    _startup_urls: list[str] = []
+    _do_register = False
+    for _a in sys.argv[1:]:
+        s = (_a or "").strip().strip('"')
+        if not s:
+            continue
+        if s.lower() in ("--register-browser", "/register"):
+            _do_register = True
+        elif s.startswith("-") or s.startswith("/"):
+            continue
+        else:
+            _startup_urls.append(s)
+
+    if _do_register:
+        _register_browser()
+        _open_default_apps_settings()
+        sys.exit(0)
 
     # Ensure exceptions aren't silently swallowed by Qt
     def _excepthook(exc_type, exc_value, exc_tb):
@@ -3926,9 +5457,28 @@ if __name__ == "__main__":
 
     try:
         from ctypes import windll
-        windll.shell32.SetCurrentProcessExplicitAppUserModelID("Gorstak.GBrowser.6.0")
+        windll.shell32.SetCurrentProcessExplicitAppUserModelID("Gorstak.GBrowser.0.6.1")
     except Exception:
         pass
+
+    # Single-instance: if a GBrowser is already running, forward our URLs to it
+    # over a local socket and exit (Ceprkac Mutex + NamedPipe parity).
+    from PyQt6.QtNetwork import QLocalServer, QLocalSocket
+    _connected = False
+    for _attempt in range(3):
+        _probe = QLocalSocket()
+        _probe.connectToServer(_SINGLE_INSTANCE_KEY)
+        if _probe.waitForConnected(500):
+            _connected = True
+            payload = ("\n".join(_startup_urls) if _startup_urls else "").encode("utf-8")
+            _probe.write(payload)
+            _probe.flush()
+            _probe.waitForBytesWritten(500)
+            _probe.disconnectFromServer()
+            break
+        _probe.abort()
+    if _connected:
+        sys.exit(0)
 
     app = QApplication(sys.argv)
 
@@ -3967,5 +5517,56 @@ if __name__ == "__main__":
         win._module_cleaner.start()
     except Exception:
         pass
+
+    # Open any URLs passed on the command line (e.g. from the OS as default browser).
+    for _u in _startup_urls:
+        try:
+            win.open_external_url(_u)
+        except Exception:
+            pass
+
+    # Register GBrowser as a browser on first run so it shows up in Default apps.
+    if sys.platform == "win32" and not os.path.exists(SETTINGS_FILE):
+        try:
+            _register_browser()
+        except Exception:
+            pass
+
+    # Single-instance server: accept forwarded URLs from later launches.
+    _server = QLocalServer()
+    QLocalServer.removeServer(_SINGLE_INSTANCE_KEY)
+    _server.listen(_SINGLE_INSTANCE_KEY)
+
+    _conn_buffers: dict = {}
+
+    def _on_new_connection():
+        conn = _server.nextPendingConnection()
+        if conn is None:
+            return
+        _conn_buffers[conn] = bytearray()
+
+        def _read():
+            try:
+                _conn_buffers[conn].extend(bytes(conn.readAll()))
+            except Exception:
+                pass
+
+        def _finish():
+            # Parse the full accumulated payload once the sender disconnects, so a
+            # payload split across packets is not truncated.
+            data = bytes(_conn_buffers.pop(conn, b"")).decode("utf-8", "ignore")
+            urls = [u.strip() for u in data.splitlines() if u.strip()]
+            if not urls:
+                win.raise_()
+                win.activateWindow()
+            else:
+                for u in urls:
+                    win.open_external_url(u)
+            conn.deleteLater()
+
+        conn.readyRead.connect(_read)
+        conn.disconnected.connect(_finish)
+
+    _server.newConnection.connect(_on_new_connection)
 
     sys.exit(app.exec())

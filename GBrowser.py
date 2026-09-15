@@ -2974,11 +2974,26 @@ class InjectedModuleCleaner:
     POLL_S = 0.05
     CHILD_ACCESS = 0x0400 | 0x0010 | 0x0002 | 0x0008 | 0x0020 | 0x1000
 
+    # Grace window after start() during which NOTHING is unloaded. Everything the
+    # browser maps while starting up (Qt, the WebEngine render/GPU/network child
+    # processes and every Windows system DLL they pull in on demand - dnsapi, mswsock,
+    # mfcore, ...) must be captured as legitimate. Unloading those mid-init is what
+    # broke DNS ("server IP address could not be found"). At the end of the window the
+    # main-process baseline is re-snapshotted, so only modules mapped AFTER init are
+    # ever unloaded.
+    INIT_GRACE_S = 12.0
+    # A newly-seen child process is left alone for this long so its own init-time
+    # modules land in its baseline before we start enforcing against it.
+    CHILD_GRACE_S = 8.0
+
     def __init__(self, owner):
         self._owner = owner
         self._prefixes: list[str] = []
         self._baseline: set[int] = set()
         self._child_baseline: dict[int, set[int]] = {}
+        self._child_seen_at: dict[int, float] = {}
+        self._armed: bool = False
+        self._init_deadline: float = 0.0
         self._queue: list[tuple[object, str]] = []
         self._qlock = threading.Lock()
         self._wake = threading.Event()
@@ -3001,6 +3016,11 @@ class InjectedModuleCleaner:
             self._baseline = {self._hmod_int(h) for h, _ in self._modules(self._k32.GetCurrentProcess())}
         except Exception:
             return
+        # Stay disarmed until the init grace window elapses; the baseline is refreshed
+        # when we arm, so the full startup module set (incl. on-demand Windows DLLs) is
+        # treated as legitimate and only later injections are unloaded.
+        self._armed = False
+        self._init_deadline = time.time() + self.INIT_GRACE_S
         self._thread = threading.Thread(target=self._run, name="GBrowser-ModuleCleaner", daemon=True)
         self._thread.start()
         self._register_ldr()
@@ -3097,6 +3117,9 @@ class InjectedModuleCleaner:
                     if us.Buffer and us.Length:
                         path = ctypes.wstring_at(us.Buffer, us.Length // 2)
                 hmod = info.DllBase
+                # While still in the init grace window, treat every load as legitimate.
+                if not self._armed:
+                    return
                 if self._is_ours(hmod, path, self._baseline):
                     return
                 with self._qlock:
@@ -3273,11 +3296,24 @@ class InjectedModuleCleaner:
         live = self._descendant_pids()
         for dead in [p for p in self._child_baseline if p not in live]:
             self._child_baseline.pop(dead, None)
+        for dead in [p for p in self._child_seen_at if p not in live]:
+            self._child_seen_at.pop(dead, None)
+        now = time.time()
         for pid in live:
             proc = self._k32.OpenProcess(self.CHILD_ACCESS, False, pid)
             if not proc:
                 continue
             try:
+                # First sighting: start the child's grace timer and don't enforce yet.
+                if pid not in self._child_seen_at:
+                    self._child_seen_at[pid] = now
+                    continue
+                # During the child's grace window keep refreshing its baseline so all
+                # of its init-time modules (Windows network/media DLLs, etc.) are kept.
+                if now - self._child_seen_at[pid] < self.CHILD_GRACE_S:
+                    self._child_baseline[pid] = {
+                        self._hmod_int(h) for h, _ in self._modules(proc)}
+                    continue
                 mods = self._modules(proc)
                 if pid not in self._child_baseline:
                     self._child_baseline[pid] = {self._hmod_int(h) for h, _ in mods}
@@ -3299,6 +3335,23 @@ class InjectedModuleCleaner:
             if self._stop.is_set():
                 break
             try:
+                if not self._armed:
+                    # Still initializing: don't unload anything. Keep refreshing the
+                    # child map so children are tracked, but hold enforcement.
+                    if time.time() >= self._init_deadline:
+                        # Re-snapshot: everything mapped during init is now the baseline.
+                        try:
+                            self._baseline = {
+                                self._hmod_int(h)
+                                for h, _ in self._modules(self._k32.GetCurrentProcess())
+                            }
+                        except Exception:
+                            pass
+                        with self._qlock:
+                            self._queue = []  # drop anything queued during init
+                        self._armed = True
+                    else:
+                        continue
                 self._drain_queue()
                 self._sweep_self()
                 self._sweep_children()

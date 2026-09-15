@@ -28,11 +28,12 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
 
 [Files]
-Source: "dist\GBrowser\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "dist\GBrowser\{#MyAppIcon}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "dist\GBrowser\*.dll"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs
-Source: "dist\GBrowser\*.pyd"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs
-Source: "dist\GBrowser\blocklist.txt"; DestDir: "{app}"; Flags: ignoreversion
+; PyInstaller 6.x (--onedir) puts GBrowser.exe at the top of dist\GBrowser and all
+; dependencies (python313.dll, Qt, etc.) under dist\GBrowser\_internal\. The .exe
+; loads python313.dll from _internal RELATIVE to itself, so the install MUST preserve
+; that directory layout. A single recursive copy does exactly that - do NOT flatten
+; *.dll into {app} (that put python313.dll in the wrong place -> "failed to load
+; module python313.dll").
 Source: "dist\GBrowser\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
